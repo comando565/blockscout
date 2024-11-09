@@ -499,6 +499,10 @@ config :explorer, Explorer.ThirdPartyIntegrations.Zerion,
   service_url: System.get_env("ZERION_BASE_API_URL", "https://api.zerion.io/v1"),
   api_key: System.get_env("ZERION_API_TOKEN")
 
+config :explorer, Explorer.ThirdPartyIntegrations.Xname,
+  service_url: System.get_env("XNAME_BASE_API_URL", "https://gateway.xname.app"),
+  api_key: System.get_env("XNAME_API_TOKEN")
+
 enabled? = ConfigHelper.parse_bool_env_var("MICROSERVICE_SC_VERIFIER_ENABLED", "true")
 # or "eth_bytecode_db"
 type = System.get_env("MICROSERVICE_SC_VERIFIER_TYPE", "sc_verifier")
@@ -618,6 +622,14 @@ config :explorer, Explorer.Migrator.RestoreOmittedWETHTransfers,
   concurrency: ConfigHelper.parse_integer_env_var("MIGRATION_RESTORE_OMITTED_WETH_TOKEN_TRANSFERS_CONCURRENCY", 5),
   batch_size: ConfigHelper.parse_integer_env_var("MIGRATION_RESTORE_OMITTED_WETH_TOKEN_TRANSFERS_BATCH_SIZE", 50),
   timeout: ConfigHelper.parse_time_env_var("MIGRATION_RESTORE_OMITTED_WETH_TOKEN_TRANSFERS_TIMEOUT", "250ms")
+
+config :explorer, Explorer.Migrator.SanitizeDuplicatedLogIndexLogs,
+  concurrency: ConfigHelper.parse_integer_env_var("MIGRATION_SANITIZE_DUPLICATED_LOG_INDEX_LOGS_CONCURRENCY", 10),
+  batch_size: ConfigHelper.parse_integer_env_var("MIGRATION_SANITIZE_DUPLICATED_LOG_INDEX_LOGS_BATCH_SIZE", 500)
+
+config :explorer, Explorer.Migrator.RefetchContractCodes,
+  concurrency: ConfigHelper.parse_integer_env_var("MIGRATION_REFETCH_CONTRACT_CODES_CONCURRENCY", 5),
+  batch_size: ConfigHelper.parse_integer_env_var("MIGRATION_REFETCH_CONTRACT_CODES_BATCH_SIZE", 100)
 
 config :explorer, Explorer.Migrator.ShrinkInternalTransactions,
   enabled: ConfigHelper.parse_bool_env_var("SHRINK_INTERNAL_TRANSACTIONS_ENABLED"),
