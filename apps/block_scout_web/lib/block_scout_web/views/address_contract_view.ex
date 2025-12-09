@@ -1,10 +1,10 @@
 defmodule BlockScoutWeb.AddressContractView do
   use BlockScoutWeb, :view
+  use Phoenix.LiveView
 
   require Logger
 
   import Explorer.Helper, only: [decode_data: 2]
-  import Phoenix.LiveView.Helpers, only: [sigil_H: 2]
 
   alias ABI.FunctionSelector
   alias Explorer.Chain
@@ -66,7 +66,7 @@ defmodule BlockScoutWeb.AddressContractView do
       type =~ "address" ->
         address_hash = "0x" <> Base.encode16(val, case: :lower)
 
-        address = get_address(address_hash)
+        address = Chain.string_to_address_hash_or_nil(address_hash)
 
         get_formatted_address_data(address, address_hash, conn)
 
@@ -87,13 +87,6 @@ defmodule BlockScoutWeb.AddressContractView do
     end
   end
 
-  defp get_address(address_hash) do
-    case Chain.string_to_address_hash(address_hash) do
-      {:ok, address} -> address
-      _ -> nil
-    end
-  end
-
   defp get_formatted_address_data(address, address_hash, conn) do
     if address != nil do
       assigns = %{address: address, address_hash: address_hash, conn: conn}
@@ -108,7 +101,7 @@ defmodule BlockScoutWeb.AddressContractView do
 
   def format_external_libraries(libraries, conn) do
     Enum.reduce(libraries, "", fn %{name: name, address_hash: address_hash}, acc ->
-      address = get_address(address_hash)
+      address = Chain.string_to_address_hash_or_nil(address_hash)
       assigns = %{acc: acc, name: name, address: address, address_hash: address_hash, conn: conn}
 
       ~H"""
@@ -120,8 +113,27 @@ defmodule BlockScoutWeb.AddressContractView do
   end
 
   def contract_creation_code(%Address{
+        contract_creation_transaction: %Transaction{
+          status: :error,
+          input: creation_code
+        }
+      }) do
+    {:failed, creation_code}
+  end
+
+  def contract_creation_code(%Address{
+        contract_creation_internal_transaction: %InternalTransaction{
+          error: error,
+          init: init
+        }
+      })
+      when not is_nil(error) do
+    {:failed, init}
+  end
+
+  def contract_creation_code(%Address{
         contract_code: %Data{bytes: <<>>},
-        contracts_creation_internal_transaction: %InternalTransaction{init: init}
+        contract_creation_internal_transaction: %InternalTransaction{init: init}
       }) do
     {:selfdestructed, init}
   end
@@ -130,15 +142,15 @@ defmodule BlockScoutWeb.AddressContractView do
     {:ok, contract_code}
   end
 
-  def creation_code(%Address{contracts_creation_transaction: %Transaction{}} = address) do
-    address.contracts_creation_transaction.input
+  def creation_code(%Address{contract_creation_transaction: %Transaction{}} = address) do
+    address.contract_creation_transaction.input
   end
 
-  def creation_code(%Address{contracts_creation_internal_transaction: %InternalTransaction{}} = address) do
-    address.contracts_creation_internal_transaction.init
+  def creation_code(%Address{contract_creation_internal_transaction: %InternalTransaction{}} = address) do
+    address.contract_creation_internal_transaction.init
   end
 
-  def creation_code(%Address{contracts_creation_transaction: nil}) do
+  def creation_code(%Address{contract_creation_transaction: nil}) do
     nil
   end
 

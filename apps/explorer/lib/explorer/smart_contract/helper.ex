@@ -7,12 +7,12 @@ defmodule Explorer.SmartContract.Helper do
   alias Explorer.Chain.{Address, Hash, SmartContract}
   alias Explorer.Chain.SmartContract.Proxy
   alias Explorer.Chain.SmartContract.Proxy.Models.Implementation
-  alias Explorer.SmartContract.Writer
-  alias Phoenix.HTML
+  alias Explorer.Helper, as: ExplorerHelper
+  alias Explorer.SmartContract.{Reader, Writer}
 
   @api_true [api?: true]
 
-  def queriable_method?(method) do
+  def queryable_method?(method) do
     method["constant"] || method["stateMutability"] == "view" || method["stateMutability"] == "pure"
   end
 
@@ -23,7 +23,7 @@ defmodule Explorer.SmartContract.Helper do
   def error?(function), do: function["type"] == "error"
 
   @doc """
-    Checks whether the function which is not queriable can be considered as read
+    Checks whether the function which is not queryable can be considered as read
     function or not.
   """
   @spec read_with_wallet_method?(%{}) :: true | false
@@ -66,7 +66,11 @@ defmodule Explorer.SmartContract.Helper do
 
   def add_contract_code_md5(attrs), do: attrs
 
-  def contract_code_md5(bytes) do
+  @doc """
+  Calculates MD5 hash of given binary.
+  """
+  @spec md5(binary()) :: String.t()
+  def md5(bytes) do
     :md5
     |> :crypto.hash(bytes)
     |> Base.encode16(case: :lower)
@@ -74,7 +78,7 @@ defmodule Explorer.SmartContract.Helper do
 
   defp attrs_extend_with_contract_code_md5(attrs, address) do
     if address.contract_code do
-      contract_code_md5 = contract_code_md5(address.contract_code.bytes)
+      contract_code_md5 = md5(address.contract_code.bytes)
 
       attrs
       |> Map.put_new(:contract_code_md5, contract_code_md5)
@@ -83,14 +87,19 @@ defmodule Explorer.SmartContract.Helper do
     end
   end
 
-  def sanitize_input(nil), do: nil
-
-  def sanitize_input(input) do
+  @doc """
+  Escapes only <, > and & symbols
+  """
+  @spec escape_minimal(any()) :: any()
+  def escape_minimal(input) when is_binary(input) do
     input
-    |> HTML.html_escape()
-    |> HTML.safe_to_string()
-    |> String.trim()
+    # should always be the first to replace
+    |> String.replace("&", "&amp;")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
   end
+
+  def escape_minimal(other), do: other
 
   def sol_file?(filename) do
     case List.last(String.split(String.downcase(filename), ".")) do
@@ -183,8 +192,8 @@ defmodule Explorer.SmartContract.Helper do
     Metadata will be sent to a verifier microservice
   """
   @spec fetch_data_for_verification(binary() | Hash.t()) :: {binary() | nil, binary(), map()}
-  def fetch_data_for_verification(address_hash) do
-    deployed_bytecode = Chain.smart_contract_bytecode(address_hash)
+  def fetch_data_for_verification(address_hash, deployed_bytecode \\ nil) do
+    deployed_bytecode = deployed_bytecode || Chain.smart_contract_bytecode(address_hash)
 
     metadata = %{
       "contractAddress" => to_string(address_hash),
@@ -240,15 +249,20 @@ defmodule Explorer.SmartContract.Helper do
   def prepare_license_type(_), do: nil
 
   @doc """
-  Pre-fetches implementation for unverified smart contract or verified proxy smart-contract
+  Pre-fetches implementation for unverified smart-contract or verified proxy smart-contract
   """
   @spec pre_fetch_implementations(Address.t()) :: Implementation.t() | nil
   def pre_fetch_implementations(address) do
     implementation =
       with {:verified_smart_contract, %SmartContract{}} <- {:verified_smart_contract, address.smart_contract},
-           {:proxy?, true} <- {:proxy?, address_is_proxy?(address, @api_true)} do
+           {:proxy?, true} <- {:proxy?, address_is_proxy?(address, @api_true)},
+           # we should fetch implementations only for original smart-contract and exclude fetching implementations of bytecode twin
+           {:bytecode_twin?, false} <- {:bytecode_twin?, address.hash != address.smart_contract.address_hash} do
         Implementation.get_implementation(address.smart_contract, @api_true)
       else
+        {:bytecode_twin?, true} ->
+          nil
+
         {:verified_smart_contract, _} ->
           if Address.smart_contract?(address) do
             smart_contract = %SmartContract{
@@ -277,4 +291,33 @@ defmodule Explorer.SmartContract.Helper do
   end
 
   def address_is_proxy?(%Address{smart_contract: _}, _), do: false
+
+  @doc """
+  Gets binary hash string from contract's getter.
+  """
+  @spec get_binary_string_from_contract_getter(binary(), binary(), SmartContract.abi(), list()) ::
+          binary() | [binary()] | nil | :error
+  def get_binary_string_from_contract_getter(signature, address_hash_string, abi, params \\ []) do
+    binary_hash =
+      case Reader.query_contract(
+             address_hash_string,
+             abi,
+             %{
+               "#{signature}" => params
+             },
+             false
+           ) do
+        %{^signature => {:ok, [result]}} ->
+          result
+
+        %{^signature => {:error, _error}} ->
+          :error
+
+        _ ->
+          nil
+      end
+
+    # todo: Dangerous, fix with https://github.com/blockscout/blockscout/issues/12544
+    ExplorerHelper.add_0x_prefix(binary_hash)
+  end
 end

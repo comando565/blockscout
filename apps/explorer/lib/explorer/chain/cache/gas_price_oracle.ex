@@ -5,15 +5,19 @@ defmodule Explorer.Chain.Cache.GasPriceOracle do
 
   require Logger
 
+  use Utils.RuntimeEnvHelper,
+    chain_identity: [:explorer, :chain_identity]
+
   import Ecto.Query,
     only: [
-      from: 2
+      from: 2,
+      where: 3
     ]
 
   alias Explorer.Chain.{Block, Wei}
 
   alias Explorer.Chain.Cache.BlockNumber
-  alias Explorer.Counters.AverageBlockTime
+  alias Explorer.Chain.Cache.Counters.AverageBlockTime
   alias Explorer.{Market, Repo}
   alias Timex.Duration
 
@@ -98,6 +102,7 @@ defmodule Explorer.Chain.Cache.GasPriceOracle do
       from(
         block in Block,
         left_join: transaction in assoc(block, :transactions),
+        as: :transaction,
         where: block.consensus == true,
         where: is_nil(transaction.gas_price) or transaction.gas_price > ^0,
         where: transaction.block_number > ^from_block_query,
@@ -168,7 +173,11 @@ defmodule Explorer.Chain.Cache.GasPriceOracle do
         }
       )
 
-    new_acc = fee_query |> Repo.all(timeout: :infinity) |> merge_gas_prices(acc, from_block_actual)
+    new_acc =
+      fee_query
+      |> filter_unknown_transaction_types(chain_identity())
+      |> Repo.all(timeout: :infinity)
+      |> merge_gas_prices(acc, from_block_actual)
 
     gas_prices = new_acc |> process_fee_data_from_db()
 
@@ -179,6 +188,14 @@ defmodule Explorer.Chain.Cache.GasPriceOracle do
       {{:error, error}, get_gas_prices_acc()}
   end
 
+  defp filter_unknown_transaction_types(query, {:optimism, :celo}) do
+    query |> where([transaction: t], is_nil(t.type) or t.type != 123)
+  end
+
+  defp filter_unknown_transaction_types(query, _chain_type) do
+    query
+  end
+
   defp merge_gas_prices(new, acc, from_block), do: Enum.take_while(new ++ acc, &(&1.block_number > from_block))
 
   defp process_fee_data_from_db([]) do
@@ -186,13 +203,14 @@ defmodule Explorer.Chain.Cache.GasPriceOracle do
       %Decimal{} = base_fee ->
         base_fee_wei = base_fee |> Wei.from(:wei)
         exchange_rate = Market.get_coin_exchange_rate()
-
         average_block_time = get_average_block_time()
 
+        gas_prices = compose_gas_price(base_fee_wei, average_block_time, exchange_rate, base_fee_wei, 0)
+
         %{
-          slow: compose_gas_price(base_fee_wei, average_block_time, exchange_rate, base_fee_wei, 0),
-          average: compose_gas_price(base_fee_wei, average_block_time, exchange_rate, base_fee_wei, 0),
-          fast: compose_gas_price(base_fee_wei, average_block_time, exchange_rate, base_fee_wei, 0)
+          slow: gas_prices,
+          average: gas_prices,
+          fast: gas_prices
         }
 
       _ ->
@@ -280,7 +298,12 @@ defmodule Explorer.Chain.Cache.GasPriceOracle do
   defp compose_gas_price(fee, time, exchange_rate, base_fee, priority_fee) do
     %{
       price: fee |> format_wei(),
-      time: time && time |> Decimal.to_float(),
+      time:
+        case time do
+          time when is_float(time) -> time
+          %Decimal{} = time -> Decimal.to_float(time)
+          _ -> nil
+        end,
       fiat_price: fiat_fee(fee, exchange_rate),
       base_fee: base_fee |> format_wei(),
       priority_fee: base_fee && priority_fee && priority_fee |> Decimal.new() |> Wei.from(:wei) |> format_wei(),
@@ -291,10 +314,10 @@ defmodule Explorer.Chain.Cache.GasPriceOracle do
 
   defp fiat_fee(fee, exchange_rate) do
     fee &&
-      exchange_rate.usd_value && simple_transaction_gas() &&
+      exchange_rate.fiat_value && simple_transaction_gas() &&
       fee
       |> Wei.to(:ether)
-      |> Decimal.mult(exchange_rate.usd_value)
+      |> Decimal.mult(exchange_rate.fiat_value)
       |> Decimal.mult(simple_transaction_gas())
       |> Decimal.round(2)
   end

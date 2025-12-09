@@ -5,9 +5,8 @@ defmodule BlockScoutWeb.API.V2.FilecoinView do
   use Utils.CompileTimeEnvHelper, chain_type: [:explorer, :chain_type]
 
   if @chain_type == :filecoin do
-    # TODO: remove when https://github.com/elixir-lang/elixir/issues/13975 comes to elixir release
-    alias Explorer.Chain, warn: false
-    alias Explorer.Chain.Address, warn: false
+    alias Explorer.Chain
+    alias Explorer.Chain.Address
 
     @api_true [api?: true]
 
@@ -93,15 +92,15 @@ defmodule BlockScoutWeb.API.V2.FilecoinView do
     def preload_and_put_filecoin_robust_address_to_search_results(search_results) do
       addresses_map =
         search_results
-        |> Enum.map(& &1["address"])
+        |> Enum.map(& &1["address_hash"])
         |> Enum.reject(&is_nil/1)
         |> Chain.hashes_to_addresses(@api_true)
-        |> Enum.group_by(&to_string(&1.hash))
+        |> Enum.into(%{}, &{to_string(&1.hash), &1})
 
       search_results
       |> Enum.map(fn
-        %{"address" => address_hash} = result when not is_nil(address_hash) ->
-          address = addresses_map[String.downcase(address_hash)] |> List.first()
+        %{"address_hash" => address_hash} = result when not is_nil(address_hash) ->
+          address = addresses_map[String.downcase(address_hash)]
           put_filecoin_robust_address(result, %{address: address, field_prefix: nil})
 
         other ->

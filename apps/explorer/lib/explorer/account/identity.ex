@@ -50,8 +50,8 @@ defmodule Explorer.Account.Identity do
   @doc false
   def changeset(identity, attrs) do
     identity
-    |> cast(attrs, [:uid, :email, :name, :nickname, :avatar, :verification_email_sent_at])
-    |> validate_required([:uid, :email, :name])
+    |> cast(attrs, [:uid, :email, :name, :nickname, :avatar, :verification_email_sent_at, :otp_sent_at])
+    |> validate_required([:uid])
     |> put_hashed_fields()
   end
 
@@ -75,7 +75,7 @@ defmodule Explorer.Account.Identity do
   - An updated Identity struct with populated virtual fields.
   """
   @spec put_session_info(t(), session()) :: t()
-  def put_session_info(identity, %{name: name, nickname: nickname, address_hash: address_hash}) do
+  def put_session_info(%__MODULE__{} = identity, %{name: name, nickname: nickname, address_hash: address_hash}) do
     %__MODULE__{
       identity
       | name: name,
@@ -84,7 +84,7 @@ defmodule Explorer.Account.Identity do
     }
   end
 
-  def put_session_info(identity, %{name: name, nickname: nickname}) do
+  def put_session_info(%__MODULE__{} = identity, %{name: name, nickname: nickname}) do
     %__MODULE__{
       identity
       | name: name,

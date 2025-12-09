@@ -3,7 +3,7 @@ defmodule BlockScoutWeb.Account.API.V2.AuthenticateController do
 
   import BlockScoutWeb.Account.AuthController, only: [current_user: 1]
 
-  alias BlockScoutWeb.{AccessHelper, CaptchaHelper}
+  alias BlockScoutWeb.AccessHelper
   alias BlockScoutWeb.Account.API.V2.UserView
   alias BlockScoutWeb.API.V2.ApiView
   alias Explorer.Account.Identity
@@ -72,27 +72,24 @@ defmodule BlockScoutWeb.Account.API.V2.AuthenticateController do
           :error
           | {:error, String.t()}
           | {:interval, integer()}
-          | {:recaptcha, false}
           | Conn.t()
-  def send_otp(conn, %{"email" => email} = params) do
-    with {:recaptcha, true} <- {:recaptcha, CaptchaHelper.recaptcha_passed?(params)} do
-      case conn |> Conn.fetch_session() |> current_user() do
-        nil ->
-          with :ok <- Auth0.send_otp(email, AccessHelper.conn_to_ip_string(conn)) do
-            conn |> put_status(200) |> json(%{message: "Success"})
-          end
+  def send_otp(conn, %{"email" => email}) do
+    case conn |> Conn.fetch_session() |> current_user() do
+      nil ->
+        with :ok <- Auth0.send_otp(email, AccessHelper.conn_to_ip_string(conn)) do
+          conn |> put_status(200) |> json(%{message: "Success"})
+        end
 
-        %{email: nil} ->
-          with :ok <- Auth0.send_otp_for_linking(email, AccessHelper.conn_to_ip_string(conn)) do
-            conn |> put_status(200) |> json(%{message: "Success"})
-          end
+      %{email: nil} ->
+        with :ok <- Auth0.send_otp_for_linking(email, AccessHelper.conn_to_ip_string(conn)) do
+          conn |> put_status(200) |> json(%{message: "Success"})
+        end
 
-        %{} ->
-          conn
-          |> put_status(500)
-          |> put_view(ApiView)
-          |> render(:message, %{message: "This account already has an email"})
-      end
+      %{} ->
+        conn
+        |> put_status(500)
+        |> put_view(ApiView)
+        |> render(:message, %{message: "This account already has an email"})
     end
   end
 
@@ -259,6 +256,7 @@ defmodule BlockScoutWeb.Account.API.V2.AuthenticateController do
          {:identity, %Identity{} = identity} <- {:identity, Identity.find_identity(uid)} do
       conn
       |> Conn.fetch_session()
+      |> configure_session(renew: true)
       |> put_session(:current_user, session)
       |> delete_resp_cookie(Application.get_env(:block_scout_web, :invalid_session_key))
       |> put_status(200)

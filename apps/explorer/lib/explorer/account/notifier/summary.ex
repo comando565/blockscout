@@ -45,18 +45,6 @@ defmodule Explorer.Account.Notifier.Summary do
     end)
   end
 
-  def process(%Chain.TokenTransfer{} = transfer) do
-    preloaded_transfer = preload(transfer)
-
-    summary = fetch_summary(preloaded_transfer.transaction, preloaded_transfer)
-
-    if summary != :nothing do
-      [summary]
-    else
-      []
-    end
-  end
-
   def process(_), do: nil
 
   def handle_collection(_transaction, []), do: []
@@ -112,7 +100,7 @@ defmodule Explorer.Account.Notifier.Summary do
          %Chain.TokenTransfer{} = transfer
        ) do
     case transfer.token.type do
-      "ERC-20" ->
+      type when type in ["ERC-20", "ZRC-2"] ->
         %Summary{
           transaction_hash: transaction.hash,
           method: method(transfer),
@@ -228,13 +216,7 @@ defmodule Explorer.Account.Notifier.Summary do
     fee
   end
 
-  def preload(%Chain.Transaction{} = transaction) do
-    Repo.preload(transaction, [:internal_transactions, token_transfers: :token])
+  defp preload(%Chain.Transaction{} = transaction) do
+    Repo.preload(transaction, token_transfers: :token)
   end
-
-  def preload(%Chain.TokenTransfer{} = transfer) do
-    Repo.preload(transfer, [:transaction, :token])
-  end
-
-  def preload(_), do: nil
 end

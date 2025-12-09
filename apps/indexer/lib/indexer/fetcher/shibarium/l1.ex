@@ -23,9 +23,9 @@ defmodule Indexer.Fetcher.Shibarium.L1 do
   import Indexer.Fetcher.Shibarium.Helper,
     only: [calc_operation_hash: 5, prepare_insert_items: 2, recalculate_cached_count: 0]
 
+  alias Explorer.{Chain, Repo}
   alias Explorer.Chain.RollupReorgMonitorQueue
   alias Explorer.Chain.Shibarium.Bridge
-  alias Explorer.{Chain, Repo}
   alias Indexer.Fetcher.RollupL1ReorgMonitor
   alias Indexer.Helper
   alias Indexer.Transform.Addresses
@@ -346,9 +346,10 @@ defmodule Indexer.Fetcher.Shibarium.L1 do
   defp get_block_check_interval(json_rpc_named_arguments) do
     with {:ok, latest_block} <- Helper.get_block_number_by_tag("latest", json_rpc_named_arguments),
          first_block = max(latest_block - @block_check_interval_range_size, 1),
-         {:ok, first_block_timestamp} <- Helper.get_block_timestamp_by_number(first_block, json_rpc_named_arguments),
+         {:ok, first_block_timestamp} <-
+           Helper.get_block_timestamp_by_number_or_tag(first_block, json_rpc_named_arguments),
          {:ok, last_safe_block_timestamp} <-
-           Helper.get_block_timestamp_by_number(latest_block, json_rpc_named_arguments) do
+           Helper.get_block_timestamp_by_number_or_tag(latest_block, json_rpc_named_arguments) do
       block_check_interval =
         ceil((last_safe_block_timestamp - first_block_timestamp) / (latest_block - first_block) * 1000 / 2)
 
@@ -562,12 +563,12 @@ defmodule Indexer.Fetcher.Shibarium.L1 do
     [
       transport: EthereumJSONRPC.HTTP,
       transport_options: [
-        http: EthereumJSONRPC.HTTP.HTTPoison,
+        http: EthereumJSONRPC.HTTP.Tesla,
         urls: [rpc_url],
         http_options: [
           recv_timeout: :timer.minutes(10),
           timeout: :timer.minutes(10),
-          hackney: [pool: :ethereum_jsonrpc]
+          pool: :ethereum_jsonrpc
         ]
       ]
     ]

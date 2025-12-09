@@ -2,6 +2,23 @@ defmodule Explorer.SmartContract.Solidity.PublishHelper do
   @moduledoc """
     Module responsible for preparing and publishing smart contracts
   """
+  require Logger
+
+  use Utils.RuntimeEnvHelper,
+    eth_bytecode_db_enabled?: [
+      :explorer,
+      [
+        Explorer.SmartContract.RustVerifierInterfaceBehaviour,
+        :eth_bytecode_db?
+      ]
+    ],
+    sourcify_enabled?: [
+      :explorer,
+      [
+        Explorer.ThirdPartyIntegrations.Sourcify,
+        :enabled
+      ]
+    ]
 
   alias Ecto.Changeset
   alias Explorer.Chain.Events.Publisher, as: EventsPublisher
@@ -31,7 +48,9 @@ defmodule Explorer.SmartContract.Solidity.PublishHelper do
           :on_demand
         )
 
-      _ ->
+      error ->
+        Logger.error("Unexpected error during verification: #{inspect(error)}")
+
         EventsPublisher.broadcast(
           prepare_verification_error("Unexpected error", address_hash_string, conn, api_v2?),
           :on_demand
@@ -147,27 +166,27 @@ defmodule Explorer.SmartContract.Solidity.PublishHelper do
     ]
   end
 
-  def check_and_verify(address_hash_string) do
-    if Application.get_env(:explorer, Explorer.SmartContract.RustVerifierInterfaceBehaviour)[:eth_bytecode_db?] do
-      LookUpSmartContractSourcesOnDemand.trigger_fetch(address_hash_string, nil, nil)
-    else
-      if Application.get_env(:explorer, Explorer.ThirdPartyIntegrations.Sourcify)[:enabled] do
-        check_by_address_in_sourcify(
-          SmartContract.select_partially_verified_by_address_hash(address_hash_string),
-          address_hash_string
-        )
-      else
+  def check_and_verify(address_hash_string, options \\ []) do
+    cond do
+      eth_bytecode_db_enabled?() ->
+        LookUpSmartContractSourcesOnDemand.trigger_fetch(options[:ip], address_hash_string)
+
+      sourcify_enabled?() ->
+        address_hash_string
+        |> SmartContract.select_partially_verified_by_address_hash()
+        |> check_by_address_in_sourcify(address_hash_string)
+
+      true ->
         {:error, :sourcify_disabled}
-      end
     end
   end
 
   def sourcify_check(address_hash_string) do
     cond do
-      Application.get_env(:explorer, Explorer.SmartContract.RustVerifierInterfaceBehaviour)[:eth_bytecode_db?] ->
+      eth_bytecode_db_enabled?() ->
         {:error, :eth_bytecode_db_enabled}
 
-      Application.get_env(:explorer, Explorer.ThirdPartyIntegrations.Sourcify)[:enabled] ->
+      sourcify_enabled?() ->
         check_by_address_in_sourcify(
           SmartContract.select_partially_verified_by_address_hash(address_hash_string),
           address_hash_string
@@ -211,7 +230,7 @@ defmodule Explorer.SmartContract.Solidity.PublishHelper do
     params = process_params(input)
 
     address_hash
-    |> Publisher.publish_smart_contract(params, abi, file_path)
+    |> Publisher.publish_smart_contract(params, abi, true, file_path)
     |> process_response()
   end
 
@@ -219,7 +238,7 @@ defmodule Explorer.SmartContract.Solidity.PublishHelper do
     params = process_params(input)
 
     address_hash
-    |> Publisher.publish_smart_contract(params, abi)
+    |> Publisher.publish_smart_contract(params, abi, false)
     |> process_response()
   end
 

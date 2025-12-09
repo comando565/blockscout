@@ -43,7 +43,6 @@ queue_target = ConfigHelper.parse_integer_env_var("DATABASE_QUEUE_TARGET", 50)
 # Configures the database
 config :explorer, Explorer.Repo,
   url: System.get_env("DATABASE_URL"),
-  listener_url: System.get_env("DATABASE_EVENT_URL"),
   pool_size: pool_size,
   ssl: ExplorerConfigHelper.ssl_enabled?(),
   queue_target: queue_target
@@ -75,6 +74,12 @@ config :explorer, Explorer.Repo.Suave,
   pool_size: 1,
   ssl: ExplorerConfigHelper.ssl_enabled?()
 
+config :explorer, Explorer.Repo.EventNotifications,
+  url: ExplorerConfigHelper.get_event_notification_db_url(),
+  pool_size: ConfigHelper.parse_integer_env_var("DATABASE_EVENT_POOL_SIZE", 10),
+  ssl: ExplorerConfigHelper.ssl_enabled?(),
+  queue_target: queue_target
+
 # Actually the following repos are not started, and its pool size remains
 # unused. Separating repos for different chain type or feature flag is
 # implemented only for the sake of keeping DB schema update relevant to the
@@ -98,7 +103,8 @@ for repo <- [
       Explorer.Repo.Shibarium,
       Explorer.Repo.Stability,
       Explorer.Repo.Zilliqa,
-      Explorer.Repo.ZkSync
+      Explorer.Repo.ZkSync,
+      Explorer.Repo.Neon
     ] do
   config :explorer, repo,
     url: System.get_env("DATABASE_URL"),

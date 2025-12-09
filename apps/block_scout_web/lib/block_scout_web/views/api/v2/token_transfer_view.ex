@@ -31,7 +31,7 @@ defmodule BlockScoutWeb.API.V2.TokenTransferView do
           token_transfers,
           &render("token_transfer.json", %{
             token_transfer: &1,
-            decoded_transaction_input: decoded_transactions_map[&1.transaction.hash],
+            decoded_transaction_input: &1.transaction && decoded_transactions_map[&1.transaction.hash],
             conn: conn
           })
         ),
@@ -59,7 +59,8 @@ defmodule BlockScoutWeb.API.V2.TokenTransferView do
       "method" => Transaction.method_name(token_transfer.transaction, decoded_input, true),
       "block_hash" => to_string(token_transfer.block_hash),
       "block_number" => token_transfer.block_number,
-      "log_index" => token_transfer.log_index
+      "log_index" => token_transfer.log_index,
+      "token_type" => token_transfer.token_type
     }
   end
 
@@ -71,20 +72,31 @@ defmodule BlockScoutWeb.API.V2.TokenTransferView do
   def prepare_token_transfer_total(token_transfer) do
     case TokensHelper.token_transfer_amount_for_api(token_transfer) do
       {:ok, :erc721_instance} ->
-        %{"token_id" => token_transfer.token_ids && List.first(token_transfer.token_ids)}
+        %{
+          "token_id" => token_transfer.token_ids && List.first(token_transfer.token_ids),
+          "token_instance" =>
+            token_transfer.token_instance &&
+              TokenView.prepare_token_instance(token_transfer.token_instance, token_transfer.token)
+        }
 
       {:ok, :erc1155_erc404_instance, value, decimals} ->
         %{
           "token_id" => token_transfer.token_ids && List.first(token_transfer.token_ids),
           "value" => value,
-          "decimals" => decimals
+          "decimals" => decimals,
+          "token_instance" =>
+            token_transfer.token_instance &&
+              TokenView.prepare_token_instance(token_transfer.token_instance, token_transfer.token)
         }
 
       {:ok, :erc1155_erc404_instance, values, token_ids, decimals} ->
         %{
           "token_id" => token_ids && List.first(token_ids),
           "value" => values && List.first(values),
-          "decimals" => decimals
+          "decimals" => decimals,
+          "token_instance" =>
+            token_transfer.token_instance &&
+              TokenView.prepare_token_instance(token_transfer.token_instance, token_transfer.token)
         }
 
       {:ok, value, decimals} ->

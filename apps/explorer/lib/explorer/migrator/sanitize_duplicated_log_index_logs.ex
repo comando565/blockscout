@@ -8,11 +8,11 @@ defmodule Explorer.Migrator.SanitizeDuplicatedLogIndexLogs do
 
   import Ecto.Query
 
-  alias Explorer.Chain.Cache.BackgroundMigrations
+  alias Explorer.Chain.Cache.{BackgroundMigrations, BlockNumber}
   alias Explorer.Chain.{Log, TokenTransfer}
   alias Explorer.Chain.Token.Instance
   alias Explorer.Migrator.FillingMigration
-  alias Explorer.Repo
+  alias Explorer.{QueryHelper, Repo}
 
   require Logger
 
@@ -22,19 +22,16 @@ defmodule Explorer.Migrator.SanitizeDuplicatedLogIndexLogs do
   def migration_name, do: @migration_name
 
   @impl FillingMigration
+  def last_unprocessed_identifiers(%{"block_number_to_process" => -1} = state), do: {[], state}
+
   def last_unprocessed_identifiers(state) do
-    block_number = state[:block_number_to_process] || 0
+    block_number = state["block_number_to_process"] || BlockNumber.get_max()
 
     limit = batch_size() * concurrency()
 
-    ids =
-      block_number
-      |> unprocessed_data_query(block_number + limit)
-      |> Repo.all(timeout: :infinity)
-      |> Enum.group_by(& &1.block_hash)
-      |> Map.to_list()
+    from_block_number = max(block_number - limit, 0)
 
-    {ids, Map.put(state, :block_number_to_process, block_number + limit)}
+    {Enum.to_list(from_block_number..block_number), Map.put(state, "block_number_to_process", from_block_number - 1)}
   end
 
   @doc """
@@ -44,11 +41,6 @@ defmodule Explorer.Migrator.SanitizeDuplicatedLogIndexLogs do
   @spec unprocessed_data_query() :: nil
   def unprocessed_data_query do
     nil
-  end
-
-  def unprocessed_data_query(block_number_start, block_number_end) do
-    Log
-    |> where([l], l.block_number >= ^block_number_start and l.block_number < ^block_number_end)
   end
 
   @impl FillingMigration
@@ -63,7 +55,14 @@ defmodule Explorer.Migrator.SanitizeDuplicatedLogIndexLogs do
 
     :ok
   """
-  def update_batch(logs_by_block) do
+  def update_batch(block_numbers) do
+    logs_by_block =
+      Log
+      |> where([l], l.block_number in ^block_numbers)
+      |> Repo.all(timeout: :infinity)
+      |> Enum.group_by(& &1.block_hash)
+      |> Map.to_list()
+
     logs_to_update =
       logs_by_block
       |> Enum.map(&process_block/1)
@@ -72,7 +71,7 @@ defmodule Explorer.Migrator.SanitizeDuplicatedLogIndexLogs do
 
     {ids, logs, ids_to_new_index} =
       logs_to_update
-      |> Enum.reduce({[], [], %{}}, fn {log, new_index}, {ids, logs, ids_to_new_index} ->
+      |> Enum.reduce({[], [], %{}}, fn {%Log{} = log, new_index}, {ids, logs, ids_to_new_index} ->
         id = {log.transaction_hash, log.block_hash, log.index}
 
         {[id | ids],
@@ -91,13 +90,7 @@ defmodule Explorer.Migrator.SanitizeDuplicatedLogIndexLogs do
       Log
       |> where(
         [log],
-        fragment(
-          "(?, ?, ?) = ANY(?::log_id[])",
-          log.transaction_hash,
-          log.block_hash,
-          log.index,
-          ^prepared_ids
-        )
+        ^QueryHelper.tuple_in([:transaction_hash, :block_hash, :index], prepared_ids)
       )
       |> Repo.delete_all(timeout: :infinity)
 
@@ -105,13 +98,7 @@ defmodule Explorer.Migrator.SanitizeDuplicatedLogIndexLogs do
         TokenTransfer
         |> where(
           [token_transfer],
-          fragment(
-            "(?, ?, ?) = ANY(?::log_id[])",
-            token_transfer.transaction_hash,
-            token_transfer.block_hash,
-            token_transfer.log_index,
-            ^prepared_ids
-          )
+          ^QueryHelper.tuple_in([:transaction_hash, :block_hash, :log_index], prepared_ids)
         )
         |> select([token_transfer], token_transfer)
         |> Repo.delete_all(timeout: :infinity)
@@ -119,7 +106,7 @@ defmodule Explorer.Migrator.SanitizeDuplicatedLogIndexLogs do
       Repo.insert_all(Log, logs, timeout: :infinity)
 
       token_transfers
-      |> Enum.map(fn token_transfer ->
+      |> Enum.map(fn %TokenTransfer{} = token_transfer ->
         id = token_transfer_to_index(token_transfer)
 
         %TokenTransfer{token_transfer | log_index: ids_to_new_index[id]}
@@ -136,6 +123,7 @@ defmodule Explorer.Migrator.SanitizeDuplicatedLogIndexLogs do
           :instances,
           :token,
           :transaction,
+          :token_instance,
           :__meta__
         ])
       end)
@@ -157,15 +145,10 @@ defmodule Explorer.Migrator.SanitizeDuplicatedLogIndexLogs do
       Instance
       |> where(
         [nft],
-        fragment(
-          "(?, ?) = ANY(?::nft_id[])",
-          nft.owner_updated_at_block,
-          nft.owner_updated_at_log_index,
-          ^nft_instances_params
-        )
+        ^QueryHelper.tuple_in([:owner_updated_at_block, :owner_updated_at_log_index], nft_instances_params)
       )
       |> Repo.all(timeout: :infinity)
-      |> Enum.map(fn nft ->
+      |> Enum.map(fn %Instance{} = nft ->
         %Instance{
           nft
           | owner_updated_at_log_index: nft_updates_map[{nft.owner_updated_at_block, nft.owner_updated_at_log_index}]

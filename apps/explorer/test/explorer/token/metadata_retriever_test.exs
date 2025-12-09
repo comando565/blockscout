@@ -534,58 +534,108 @@ defmodule Explorer.Token.MetadataRetrieverTest do
 
       on_exit(fn -> Application.put_env(:explorer, :token_functions_reader_max_retries, original) end)
     end
-  end
 
-  test "returns name and symbol when they are bytes32" do
-    token = insert(:token, contract_address: build(:contract_address))
+    test "returns name and symbol when they are bytes32" do
+      token = insert(:token, contract_address: build(:contract_address))
 
-    expect(
-      EthereumJSONRPC.Mox,
-      :json_rpc,
-      1,
-      fn requests, _opts ->
-        {:ok,
-         Enum.map(requests, fn
-           %{id: id, method: "eth_call", params: [%{data: "0x313ce567", to: _}, "latest"]} ->
-             %{
-               id: id,
-               result: "0x0000000000000000000000000000000000000000000000000000000000000012"
-             }
+      expect(
+        EthereumJSONRPC.Mox,
+        :json_rpc,
+        1,
+        fn requests, _opts ->
+          {:ok,
+           Enum.map(requests, fn
+             %{id: id, method: "eth_call", params: [%{data: "0x313ce567", to: _}, "latest"]} ->
+               %{
+                 id: id,
+                 result: "0x0000000000000000000000000000000000000000000000000000000000000012"
+               }
 
-           %{id: id, method: "eth_call", params: [%{data: "0x06fdde03", to: _}, "latest"]} ->
-             %{
-               id: id,
-               result: "0x4d616b6572000000000000000000000000000000000000000000000000000000"
-             }
+             %{id: id, method: "eth_call", params: [%{data: "0x06fdde03", to: _}, "latest"]} ->
+               %{
+                 id: id,
+                 result: "0x4d616b6572000000000000000000000000000000000000000000000000000000"
+               }
 
-           %{id: id, method: "eth_call", params: [%{data: "0x95d89b41", to: _}, "latest"]} ->
-             %{
-               id: id,
-               result: "0x4d4b520000000000000000000000000000000000000000000000000000000000"
-             }
+             %{id: id, method: "eth_call", params: [%{data: "0x95d89b41", to: _}, "latest"]} ->
+               %{
+                 id: id,
+                 result: "0x4d4b520000000000000000000000000000000000000000000000000000000000"
+               }
 
-           %{id: id, method: "eth_call", params: [%{data: "0x18160ddd", to: _}, "latest"]} ->
-             %{
-               id: id,
-               result: "0x00000000000000000000000000000000000000000000d3c21bcecceda1000000"
-             }
-         end)}
-      end
-    )
+             %{id: id, method: "eth_call", params: [%{data: "0x18160ddd", to: _}, "latest"]} ->
+               %{
+                 id: id,
+                 result: "0x00000000000000000000000000000000000000000000d3c21bcecceda1000000"
+               }
+           end)}
+        end
+      )
 
-    expected = %{
-      decimals: 18,
-      name: "Maker",
-      symbol: "MKR",
-      total_supply: 1_000_000_000_000_000_000_000_000
-    }
+      expected = %{
+        decimals: 18,
+        name: "Maker",
+        symbol: "MKR",
+        total_supply: 1_000_000_000_000_000_000_000_000
+      }
 
-    assert MetadataRetriever.get_functions_of(token) == expected
+      assert MetadataRetriever.get_functions_of(token) == expected
+    end
+
+    test "sets skip_metadata if contract does not have metadata" do
+      token = insert(:token, contract_address: build(:contract_address))
+
+      expect(
+        EthereumJSONRPC.Mox,
+        :json_rpc,
+        3,
+        fn requests, _opts ->
+          {:ok,
+           Enum.map(requests, fn
+             %{id: id, method: "eth_call", params: [%{data: _, to: _}, "latest"]} ->
+               %{
+                 id: id,
+                 error: %{code: -32015, data: "something", message: "execution reverted"},
+                 jsonrpc: "2.0"
+               }
+           end)}
+        end
+      )
+
+      assert MetadataRetriever.get_functions_of(token, set_skip_metadata: true) == %{skip_metadata: true}
+    end
+
+    test "does not set skip_metadata if errors are not contract related" do
+      token = insert(:token, contract_address: build(:contract_address))
+
+      expect(
+        EthereumJSONRPC.Mox,
+        :json_rpc,
+        3,
+        fn requests, _opts ->
+          {:ok,
+           Enum.map(requests, fn
+             %{id: id, method: "eth_call", params: [%{data: "0x313ce567", to: _}, "latest"]} ->
+               %{
+                 id: id,
+                 error: %{code: -32015, data: "something", message: "network error"},
+                 jsonrpc: "2.0"
+               }
+           end)}
+        end
+      )
+
+      assert MetadataRetriever.get_functions_of(token, set_skip_metadata: true) == %{skip_metadata: false}
+    end
   end
 
   describe "fetch_json/4" do
     setup do
       bypass = Bypass.open()
+
+      on_exit(fn ->
+        Application.put_env(:tesla, :adapter, Explorer.Mock.TeslaAdapter)
+      end)
 
       {:ok, bypass: bypass}
     end
@@ -673,14 +723,17 @@ defmodule Explorer.Token.MetadataRetrieverTest do
         "collectionId" => "1871_1665123820823"
       }
 
-      Application.put_env(:explorer, :http_adapter, Explorer.Mox.HTTPoison)
-
-      Explorer.Mox.HTTPoison
-      |> expect(:get, fn "https://ipfs.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP?x-apikey=mykey",
-                         _headers,
-                         _options ->
-        {:ok, %HTTPoison.Response{status_code: 200, body: Jason.encode!(result)}}
-      end)
+      Tesla.Test.expect_tesla_call(
+        times: 1,
+        returns: fn %{url: "https://ipfs.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP?x-apikey=mykey"},
+                    _opts ->
+          {:ok,
+           %Tesla.Env{
+             status: 200,
+             body: Jason.encode!(result)
+           }}
+        end
+      )
 
       assert {:ok,
               %{
@@ -693,7 +746,6 @@ defmodule Explorer.Token.MetadataRetrieverTest do
                 }
               }} == MetadataRetriever.fetch_json({:ok, [data]})
 
-      Application.put_env(:explorer, :http_adapter, HTTPoison)
       Application.put_env(:indexer, :ipfs, configuration)
     end
 
@@ -717,12 +769,16 @@ defmodule Explorer.Token.MetadataRetrieverTest do
         "collectionId" => "1871_1665123820823"
       }
 
-      Application.put_env(:explorer, :http_adapter, Explorer.Mox.HTTPoison)
-
-      Explorer.Mox.HTTPoison
-      |> expect(:get, fn "https://ipfs.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP", _headers, _options ->
-        {:ok, %HTTPoison.Response{status_code: 200, body: Jason.encode!(result)}}
-      end)
+      Tesla.Test.expect_tesla_call(
+        times: 1,
+        returns: fn %{url: "https://ipfs.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP"}, _opts ->
+          {:ok,
+           %Tesla.Env{
+             status: 200,
+             body: Jason.encode!(result)
+           }}
+        end
+      )
 
       assert {:ok,
               %{
@@ -735,7 +791,6 @@ defmodule Explorer.Token.MetadataRetrieverTest do
                 }
               }} == MetadataRetriever.fetch_json({:ok, [data]})
 
-      Application.put_env(:explorer, :http_adapter, HTTPoison)
       Application.put_env(:indexer, :ipfs, configuration)
     end
 
@@ -759,14 +814,20 @@ defmodule Explorer.Token.MetadataRetrieverTest do
         "collectionId" => "1871_1665123820823"
       }
 
-      Application.put_env(:explorer, :http_adapter, Explorer.Mox.HTTPoison)
-
-      Explorer.Mox.HTTPoison
-      |> expect(:get, fn "https://ipfs.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP",
-                         [{"x-apikey", "mykey"}, {"User-Agent", _}],
-                         _options ->
-        {:ok, %HTTPoison.Response{status_code: 200, body: Jason.encode!(result)}}
-      end)
+      Tesla.Test.expect_tesla_call(
+        times: 1,
+        returns: fn %{
+                      url: "https://ipfs.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP",
+                      headers: [{"x-apikey", "mykey"}, {"User-Agent", _}]
+                    },
+                    _opts ->
+          {:ok,
+           %Tesla.Env{
+             status: 200,
+             body: Jason.encode!(result)
+           }}
+        end
+      )
 
       assert {:ok,
               %{
@@ -779,7 +840,6 @@ defmodule Explorer.Token.MetadataRetrieverTest do
                 }
               }} == MetadataRetriever.fetch_json({:ok, [data]})
 
-      Application.put_env(:explorer, :http_adapter, HTTPoison)
       Application.put_env(:indexer, :ipfs, configuration)
     end
 
@@ -792,12 +852,16 @@ defmodule Explorer.Token.MetadataRetrieverTest do
       }
       """
 
+      Application.put_env(:tesla, :adapter, Tesla.Adapter.Mint)
+
       Bypass.expect(bypass, "GET", path, fn conn ->
         Conn.resp(conn, 200, json)
       end)
 
-      assert {:ok, %{metadata: %{"name" => "Sérgio Mendonça"}}} ==
-               MetadataRetriever.fetch_json({:ok, ["http://localhost:#{bypass.port}#{path}"]})
+      url = "http://localhost:#{bypass.port}#{path}"
+
+      assert {:ok_store_uri, %{metadata: %{"name" => "Sérgio Mendonça"}}, url} ==
+               MetadataRetriever.fetch_json({:ok, [url]})
     end
 
     test "fetches json metadata when HTTP status 301", %{bypass: bypass} do
@@ -820,12 +884,16 @@ defmodule Explorer.Token.MetadataRetrieverTest do
       }
       """
 
+      Application.put_env(:tesla, :adapter, Tesla.Adapter.Mint)
+
       Bypass.expect(bypass, "GET", path, fn conn ->
         Conn.resp(conn, 200, json)
       end)
 
-      {:ok, %{metadata: metadata}} =
-        MetadataRetriever.fetch_metadata_from_uri("http://localhost:#{bypass.port}#{path}", [])
+      url = "http://localhost:#{bypass.port}#{path}"
+
+      {:ok_store_uri, %{metadata: metadata}, ^url} =
+        MetadataRetriever.fetch_metadata_from_uri(url, [])
 
       assert Map.get(metadata, "attributes") == Jason.decode!(attributes)
     end
@@ -894,14 +962,16 @@ defmodule Explorer.Token.MetadataRetrieverTest do
       }
       """
 
-      Application.put_env(:explorer, :http_adapter, Explorer.Mox.HTTPoison)
-
-      Explorer.Mox.HTTPoison
-      |> expect(:get, fn "https://ipfs.io/ipfs/bafybeig6nlmyzui7llhauc52j2xo5hoy4lzp6442lkve5wysdvjkizxonu",
-                         _headers,
-                         _options ->
-        {:ok, %HTTPoison.Response{status_code: 200, body: json}}
-      end)
+      Tesla.Test.expect_tesla_call(
+        times: 1,
+        returns: fn %{url: "https://ipfs.io/ipfs/bafybeig6nlmyzui7llhauc52j2xo5hoy4lzp6442lkve5wysdvjkizxonu"}, _opts ->
+          {:ok,
+           %Tesla.Env{
+             status: 200,
+             body: json
+           }}
+        end
+      )
 
       data =
         {:ok,
@@ -915,8 +985,6 @@ defmodule Explorer.Token.MetadataRetrieverTest do
                   "image" => "https://ipfs.io/ipfs/bafybeig6nlmyzui7llhauc52j2xo5hoy4lzp6442lkve5wysdvjkizxonu"
                 }
               }} == MetadataRetriever.fetch_json(data)
-
-      Application.put_env(:explorer, :http_adapter, HTTPoison)
     end
 
     test "Fetches metadata from ipfs" do
@@ -928,14 +996,17 @@ defmodule Explorer.Token.MetadataRetrieverTest do
       }
       """
 
-      Application.put_env(:explorer, :http_adapter, Explorer.Mox.HTTPoison)
-
-      Explorer.Mox.HTTPoison
-      |> expect(:get, fn "https://ipfs.io/ipfs/bafybeid4ed2ua7fwupv4nx2ziczr3edhygl7ws3yx6y2juon7xakgj6cfm/51.json",
-                         _headers,
-                         _options ->
-        {:ok, %HTTPoison.Response{status_code: 200, body: json}}
-      end)
+      Tesla.Test.expect_tesla_call(
+        times: 1,
+        returns: fn %{url: "https://ipfs.io/ipfs/bafybeid4ed2ua7fwupv4nx2ziczr3edhygl7ws3yx6y2juon7xakgj6cfm/51.json"},
+                    _opts ->
+          {:ok,
+           %Tesla.Env{
+             status: 200,
+             body: json
+           }}
+        end
+      )
 
       data =
         {:ok,
@@ -949,16 +1020,16 @@ defmodule Explorer.Token.MetadataRetrieverTest do
        }} = MetadataRetriever.fetch_json(data)
 
       assert "ipfs://bafybeihxuj3gxk7x5p36amzootyukbugmx3pw7dyntsrohg3se64efkuga/51.png" == Map.get(metadata, "image")
-      Application.put_env(:explorer, :http_adapter, HTTPoison)
     end
 
     test "Fetches metadata from '${url}'", %{bypass: bypass} do
       path = "/data/8/8578.json"
+      url = "http://localhost:#{bypass.port}#{path}"
 
       data =
         {:ok,
          [
-           "'http://localhost:#{bypass.port}#{path}'"
+           "'#{url}'"
          ]}
 
       json = """
@@ -975,14 +1046,16 @@ defmodule Explorer.Token.MetadataRetrieverTest do
       }
       """
 
+      Application.put_env(:tesla, :adapter, Tesla.Adapter.Mint)
+
       Bypass.expect(bypass, "GET", path, fn conn ->
         Conn.resp(conn, 200, json)
       end)
 
-      assert {:ok,
+      assert {:ok_store_uri,
               %{
                 metadata: Jason.decode!(json)
-              }} == MetadataRetriever.fetch_json(data)
+              }, url} == MetadataRetriever.fetch_json(data)
     end
 
     test "Process custom execution reverted" do
@@ -1004,12 +1077,16 @@ defmodule Explorer.Token.MetadataRetrieverTest do
         "collectionId" => "1871_1665123820823"
       }
 
-      Application.put_env(:explorer, :http_adapter, Explorer.Mox.HTTPoison)
-
-      Explorer.Mox.HTTPoison
-      |> expect(:get, fn "https://ipfs.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP", _headers, _options ->
-        {:ok, %HTTPoison.Response{status_code: 200, body: Jason.encode!(result)}}
-      end)
+      Tesla.Test.expect_tesla_call(
+        times: 1,
+        returns: fn %{url: "https://ipfs.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP"}, _opts ->
+          {:ok,
+           %Tesla.Env{
+             status: 200,
+             body: Jason.encode!(result)
+           }}
+        end
+      )
 
       assert {:ok,
               %{
@@ -1021,8 +1098,6 @@ defmodule Explorer.Token.MetadataRetrieverTest do
                   "salePrice" => 34
                 }
               }} == MetadataRetriever.fetch_json({:ok, [data]})
-
-      Application.put_env(:explorer, :http_adapter, HTTPoison)
     end
 
     test "Process URI directly from link", %{bypass: bypass} do
@@ -1058,15 +1133,113 @@ defmodule Explorer.Token.MetadataRetrieverTest do
       }
       """
 
+      Application.put_env(:tesla, :adapter, Tesla.Adapter.Mint)
+
       Bypass.expect(bypass, "GET", path, fn conn ->
         Conn.resp(conn, 200, json)
       end)
 
-      assert {:ok,
+      url = "http://localhost:#{bypass.port}#{path}"
+
+      assert {:ok_store_uri,
               %{
                 metadata: Jason.decode!(json)
-              }} ==
-               MetadataRetriever.fetch_json({:ok, ["http://localhost:#{bypass.port}#{path}"]})
+              }, url} ==
+               MetadataRetriever.fetch_json({:ok, [url]})
+    end
+  end
+
+  describe "ipfs_link/1" do
+    test "returns correct ipfs link for given data" do
+      data = "QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP"
+      expected_link = "https://ipfs.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP"
+
+      assert MetadataRetriever.ipfs_link(data) == expected_link
+    end
+
+    test "returns correct ipfs link for given data at public IPFS gateway URL" do
+      original = Application.get_env(:indexer, :ipfs)
+
+      Application.put_env(:indexer, :ipfs,
+        gateway_url: "https://ipfs.io/ipfs/",
+        public_gateway_url: "https://public_ipfs_gateway.io/ipfs/"
+      )
+
+      data = "QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP"
+      expected_link = "https://public_ipfs_gateway.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP"
+
+      assert MetadataRetriever.ipfs_link(data, true) == expected_link
+
+      Application.put_env(:indexer, :ipfs, original)
+    end
+
+    test "returns correct ipfs link for given data with IPFS gateway params" do
+      original = Application.get_env(:indexer, :ipfs)
+
+      Application.put_env(:indexer, :ipfs,
+        gateway_url: "https://ipfs.io/ipfs/",
+        gateway_url_param_key: "user",
+        gateway_url_param_value: "pass",
+        gateway_url_param_location: :query
+      )
+
+      data = "QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP"
+      expected_link = "https://ipfs.io/ipfs/QmT1Yz43R1PLn2RVovAnEM5dHQEvpTcnwgX8zftvY1FcjP?user=pass"
+
+      assert MetadataRetriever.ipfs_link(data) == expected_link
+
+      Application.put_env(:indexer, :ipfs, original)
+    end
+
+    test "returns correct ipfs link for empty data" do
+      data = ""
+      expected_link = "https://ipfs.io/ipfs/"
+
+      assert MetadataRetriever.ipfs_link(data) == expected_link
+    end
+
+    test "returns correct ipfs link for nil data" do
+      data = nil
+      expected_link = "https://ipfs.io/ipfs/"
+
+      assert MetadataRetriever.ipfs_link(data) == expected_link
+    end
+
+    test "returns correct ipfs link for data with special characters" do
+      data = "data_with_special_chars!@#$%^&*()"
+      expected_link = "https://ipfs.io/ipfs/data_with_special_chars!@#$%^&*()"
+
+      assert MetadataRetriever.ipfs_link(data) == expected_link
+    end
+  end
+
+  describe "arweave_link/1" do
+    test "returns correct arweave link for given data" do
+      data = "some_arweave_data"
+      expected_link = "https://arweave.net/some_arweave_data"
+
+      assert MetadataRetriever.arweave_link(data) == expected_link
+    end
+
+    test "returns correct arweave link for empty data" do
+      data = ""
+      expected_link = "https://arweave.net/"
+
+      assert MetadataRetriever.arweave_link(data) == expected_link
+    end
+
+    test "returns correct arweave link for nil data" do
+      data = nil
+      expected_link = "https://arweave.net/"
+
+      assert MetadataRetriever.arweave_link(data) == expected_link
+    end
+
+    test "returns correct arweave link for data with special characters" do
+      data = "data_with_special_chars!@#$%^&*()"
+      expected_link = "https://arweave.net/data_with_special_chars!@#$%^&*()"
+
+      assert MetadataRetriever.arweave_link(data) == expected_link
     end
   end
 end

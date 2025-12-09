@@ -20,9 +20,7 @@ defmodule Indexer.Fetcher.Optimism.Withdrawal do
   alias Indexer.Helper
 
   @fetcher_name :optimism_withdrawals
-
-  # 32-byte signature of the event MessagePassed(uint256 indexed nonce, address indexed sender, address indexed target, uint256 value, uint256 gasLimit, bytes data, bytes32 withdrawalHash)
-  @message_passed_event "0x02a52367d10742d8032712c1bb8e0144ff1ec5ffda1ed7d70bb05a2744955054"
+  @counter_type "optimism_withdrawals_fetcher_last_l2_block_hash"
 
   def child_spec(start_link_arguments) do
     spec = %{
@@ -41,13 +39,15 @@ defmodule Indexer.Fetcher.Optimism.Withdrawal do
 
   @impl GenServer
   def init(args) do
-    json_rpc_named_arguments = args[:json_rpc_named_arguments]
-    {:ok, %{}, {:continue, json_rpc_named_arguments}}
+    {:ok, %{}, {:continue, args[:json_rpc_named_arguments]}}
   end
 
   @impl GenServer
   def handle_continue(json_rpc_named_arguments, state) do
     Logger.metadata(fetcher: @fetcher_name)
+
+    # two seconds pause needed to avoid exceeding Supervisor restart intensity when DB issues
+    :timer.sleep(2000)
 
     env = Application.get_all_env(:indexer)[__MODULE__]
 
@@ -141,7 +141,7 @@ defmodule Indexer.Fetcher.Optimism.Withdrawal do
 
     if not safe_block_is_latest do
       # find and fill all events between "safe" and "latest" block (excluding "safe")
-      {:ok, latest_block} = Optimism.get_block_number_by_tag("latest", json_rpc_named_arguments)
+      {:ok, latest_block} = Helper.get_block_number_by_tag("latest", json_rpc_named_arguments)
       fill_block_range(safe_block + 1, latest_block, message_passer, json_rpc_named_arguments, eth_get_logs_range_size)
     end
 
@@ -214,13 +214,15 @@ defmodule Indexer.Fetcher.Optimism.Withdrawal do
          block_end,
          json_rpc_named_arguments
        ) do
+    message_passed_event = OptimismWithdrawal.message_passed_event()
+
     withdrawals =
       if scan_db do
         query =
           from(log in Log,
             select: {log.second_topic, log.data, log.transaction_hash, log.block_number},
             where:
-              log.first_topic == ^@message_passed_event and log.address_hash == ^message_passer and
+              log.first_topic == ^message_passed_event and log.address_hash == ^message_passer and
                 log.block_number >= ^block_start and log.block_number <= ^block_end
           )
 
@@ -231,12 +233,13 @@ defmodule Indexer.Fetcher.Optimism.Withdrawal do
         end)
       else
         {:ok, result} =
-          Optimism.get_logs(
+          Helper.get_logs(
             block_start,
             block_end,
             message_passer,
-            @message_passed_event,
+            [message_passed_event],
             json_rpc_named_arguments,
+            0,
             3
           )
 
@@ -324,6 +327,8 @@ defmodule Indexer.Fetcher.Optimism.Withdrawal do
         eth_get_logs_range_size,
         false
       )
+
+      Optimism.set_last_block_hash_by_number(end_block, @counter_type, json_rpc_named_arguments)
     end
   end
 
@@ -393,7 +398,8 @@ defmodule Indexer.Fetcher.Optimism.Withdrawal do
       :L2,
       &OptimismWithdrawal.last_withdrawal_l2_block_number_query/0,
       &OptimismWithdrawal.remove_withdrawals_query/1,
-      json_rpc_named_arguments
+      json_rpc_named_arguments,
+      @counter_type
     )
   end
 

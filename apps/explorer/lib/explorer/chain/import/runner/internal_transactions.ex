@@ -9,9 +9,21 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
   alias Ecto.Adapters.SQL
   alias Ecto.{Changeset, Multi, Repo}
   alias EthereumJSONRPC.Utility.RangesHelper
-  alias Explorer.Chain.{Block, Hash, Import, InternalTransaction, PendingBlockOperation, Transaction}
+
+  alias Explorer.Chain.{
+    Block,
+    Hash,
+    Import,
+    InternalTransaction,
+    PendingOperationsHelper,
+    PendingTransactionOperation,
+    Transaction
+  }
+
   alias Explorer.Chain.Events.Publisher
   alias Explorer.Chain.Import.Runner
+  alias Explorer.Chain.InternalTransaction.ZeroValueDeleteQueue
+  alias Explorer.Migrator.DeleteZeroValueInternalTransactions
   alias Explorer.Prometheus.Instrumenter
   alias Explorer.Repo, as: ExplorerRepo
   alias Explorer.Utility.MissingRangesManipulator
@@ -73,9 +85,9 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
         :acquire_pending_internal_transactions
       )
     end)
-    |> Multi.run(:acquire_transactions, fn repo, %{acquire_pending_internal_transactions: pending_block_hashes} ->
+    |> Multi.run(:acquire_transactions, fn repo, %{acquire_pending_internal_transactions: pending_ops_hashes} ->
       Instrumenter.block_import_stage_runner(
-        fn -> acquire_transactions(repo, pending_block_hashes) end,
+        fn -> acquire_transactions(repo, pending_ops_hashes) end,
         :block_pending,
         :internal_transactions,
         :acquire_transactions
@@ -171,14 +183,22 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
     end)
     |> Multi.run(:update_pending_blocks_status, fn repo,
                                                    %{
-                                                     acquire_pending_internal_transactions: pending_block_hashes,
+                                                     acquire_pending_internal_transactions: pending_ops_hashes,
                                                      set_refetch_needed_for_invalid_blocks: invalid_block_hashes
                                                    } ->
       Instrumenter.block_import_stage_runner(
-        fn -> update_pending_blocks_status(repo, pending_block_hashes, invalid_block_hashes) end,
+        fn -> update_pending_blocks_status(repo, pending_ops_hashes, invalid_block_hashes) end,
         :block_pending,
         :internal_transactions,
         :update_pending_blocks_status
+      )
+    end)
+    |> Multi.run(:save_zero_value_to_delete, fn repo, %{internal_transactions: internal_transactions} ->
+      Instrumenter.block_import_stage_runner(
+        fn -> save_zero_value_to_delete(repo, internal_transactions, insert_options) end,
+        :block_pending,
+        :internal_transactions,
+        :save_zero_value_to_delete
       )
     end)
   end
@@ -310,24 +330,44 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
   end
 
   defp acquire_pending_internal_transactions(repo, block_hashes) do
-    query =
-      from(
-        pending_ops in PendingBlockOperation,
-        where: pending_ops.block_hash in ^block_hashes,
-        select: pending_ops.block_hash,
-        # Enforce PendingBlockOperation ShareLocks order (see docs: sharelocks.md)
-        order_by: [asc: pending_ops.block_hash],
-        lock: "FOR UPDATE"
-      )
+    case PendingOperationsHelper.pending_operations_type() do
+      "blocks" ->
+        query =
+          block_hashes
+          |> PendingOperationsHelper.block_hash_in_query()
+          |> select([pbo], pbo.block_hash)
+          |> order_by([pbo], asc: pbo.block_hash)
+          |> lock("FOR UPDATE")
 
-    {:ok, repo.all(query)}
+        {:ok, {:block_hashes, repo.all(query)}}
+
+      "transactions" ->
+        query =
+          from(
+            pending_ops in PendingTransactionOperation,
+            join: transaction in assoc(pending_ops, :transaction),
+            where: transaction.block_hash in ^block_hashes,
+            select: pending_ops.transaction_hash,
+            # Enforce PendingTransactionOperation ShareLocks order (see docs: sharelocks.md)
+            order_by: [asc: pending_ops.transaction_hash],
+            lock: "FOR UPDATE"
+          )
+
+        {:ok, {:transaction_hashes, repo.all(query)}}
+    end
   end
 
-  defp acquire_transactions(repo, pending_block_hashes) do
+  defp acquire_transactions(repo, pending_ops_hashes) do
+    dynamic_condition =
+      case pending_ops_hashes do
+        {:block_hashes, block_hashes} -> dynamic([t], t.block_hash in ^block_hashes)
+        {:transaction_hashes, transaction_hashes} -> dynamic([t], t.hash in ^transaction_hashes)
+      end
+
     query =
       from(
         t in Transaction,
-        where: t.block_hash in ^pending_block_hashes,
+        where: ^dynamic_condition,
         select: map(t, [:hash, :block_hash, :block_number, :cumulative_gas_used, :status]),
         # Enforce Transaction ShareLocks order (see docs: sharelocks.md)
         order_by: [asc: t.hash],
@@ -426,6 +466,7 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
         entry
         |> Map.put(:block_hash, block_hash)
         |> Map.put(:block_index, index)
+        |> sanitize_error()
       end)
     else
       []
@@ -463,6 +504,21 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
     else
       {:ok, internal_transactions}
     end
+  end
+
+  defp sanitize_error(entry) do
+    error = Map.get(entry, :error)
+
+    sanitized_error =
+      if is_binary(error) and not String.printable?(error) do
+        error
+        |> inspect(binaries: :as_strings)
+        |> String.trim("\"")
+      else
+        error
+      end
+
+    Map.put(entry, :error, sanitized_error)
   end
 
   def defer_internal_transactions_primary_key(repo) do
@@ -786,17 +842,23 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
   end
 
   def update_pending_blocks_status(repo, pending_hashes, invalid_block_hashes) do
-    valid_block_hashes =
-      pending_hashes
-      |> MapSet.new()
-      |> MapSet.difference(MapSet.new(invalid_block_hashes))
-      |> MapSet.to_list()
-
     delete_query =
-      from(
-        pending_ops in PendingBlockOperation,
-        where: pending_ops.block_hash in ^valid_block_hashes
-      )
+      case pending_hashes do
+        {:block_hashes, block_hashes} ->
+          valid_block_hashes =
+            block_hashes
+            |> MapSet.new()
+            |> MapSet.difference(MapSet.new(invalid_block_hashes))
+            |> MapSet.to_list()
+
+          PendingOperationsHelper.block_hash_in_query(valid_block_hashes)
+
+        {:transaction_hashes, transaction_hashes} ->
+          from(
+            pending_ops in PendingTransactionOperation,
+            where: pending_ops.transaction_hash in ^transaction_hashes
+          )
+      end
 
     try do
       # ShareLocks order already enforced by `acquire_pending_internal_transactions` (see docs: sharelocks.md)
@@ -805,7 +867,37 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
       {:ok, deleted}
     rescue
       postgrex_error in Postgrex.Error ->
-        {:error, %{exception: postgrex_error, pending_hashes: valid_block_hashes}}
+        {:error, %{exception: postgrex_error, pending_hashes: pending_hashes}}
+    end
+  end
+
+  defp save_zero_value_to_delete(repo, internal_transactions, %{timeout: timeout, timestamps: timestamps}) do
+    with true <- Application.get_env(:explorer, DeleteZeroValueInternalTransactions)[:enabled],
+         border_number when is_integer(border_number) <- DeleteZeroValueInternalTransactions.border_number() do
+      internal_transactions
+      |> Enum.map(& &1.block_number)
+      |> Enum.uniq()
+      |> Enum.filter(&(not is_nil(&1) and &1 <= border_number))
+      |> Enum.map(&Map.put(timestamps, :block_number, &1))
+      |> case do
+        [] ->
+          {:ok, []}
+
+        insert_params ->
+          {_total, result} =
+            repo.insert_all(
+              ZeroValueDeleteQueue,
+              insert_params,
+              conflict_target: [:block_number],
+              on_conflict: {:replace, [:updated_at]},
+              returning: [:block_number],
+              timeout: timeout
+            )
+
+          {:ok, result}
+      end
+    else
+      _ -> {:ok, []}
     end
   end
 

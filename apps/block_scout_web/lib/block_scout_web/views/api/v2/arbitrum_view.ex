@@ -3,8 +3,9 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
 
   alias BlockScoutWeb.API.V2.ApiView
   alias BlockScoutWeb.API.V2.Helper, as: APIV2Helper
+  alias Explorer.Chain.Arbitrum.{L1Batch, LifecycleTransaction}
+  alias Explorer.Chain.Arbitrum.Reader.API.Settlement, as: SettlementReader
   alias Explorer.Chain.{Block, Hash, Transaction, Wei}
-  alias Explorer.Chain.Arbitrum.{L1Batch, LifecycleTransaction, Reader}
 
   @doc """
     Function to render error\\text responses for GET requests
@@ -27,7 +28,7 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
       |> Enum.map(fn msg ->
         %{
           "id" => msg.message_id,
-          "origination_address" => msg.originator_address,
+          "origination_address_hash" => msg.originator_address,
           "origination_transaction_hash" => msg.originating_transaction_hash,
           "origination_timestamp" => msg.origination_timestamp,
           "origination_transaction_block_number" => msg.originating_transaction_block_number,
@@ -73,12 +74,12 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   def render("arbitrum_claim_message.json", %{calldata: calldata, address: address}) do
     %{
       "calldata" => calldata,
-      "outbox_address" => address
+      "outbox_address_hash" => address
     }
   end
 
   @doc """
-    Function to render GET requests to `/api/v2/arbitrum/messages/from-rollup/:msg_id/proof` endpoint.
+    Function to render GET requests to `/api/v2/arbitrum/messages/withdrawals/:transaction_hash` endpoint.
   """
   def render("arbitrum_withdrawals.json", %{withdrawals: withdrawals}) do
     withdrawals_out =
@@ -87,14 +88,19 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
         %{
           "id" => withdraw.message_id,
           "status" => withdraw.status,
-          "caller" => withdraw.caller,
-          "destination" => withdraw.destination,
+          "caller_address_hash" => withdraw.caller,
+          "destination_address_hash" => withdraw.destination,
           "arb_block_number" => withdraw.arb_block_number,
           "eth_block_number" => withdraw.eth_block_number,
           "l2_timestamp" => withdraw.l2_timestamp,
-          "callvalue" => withdraw.callvalue,
+          "callvalue" => Integer.to_string(withdraw.callvalue),
           "data" => withdraw.data,
-          "token" => withdraw.token
+          "token" =>
+            case withdraw.token do
+              %{} -> Map.update!(withdraw.token, :amount, &Integer.to_string/1)
+              _ -> nil
+            end,
+          "completion_transaction_hash" => withdraw.completion_transaction_hash
         }
       end)
 
@@ -108,10 +114,10 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
     %{
       "number" => batch.number,
       "transactions_count" => batch.transactions_count,
-      "start_block" => batch.start_block,
-      "end_block" => batch.end_block,
-      "before_acc" => batch.before_acc,
-      "after_acc" => batch.after_acc
+      "start_block_number" => batch.start_block,
+      "end_block_number" => batch.end_block,
+      "before_acc_hash" => batch.before_acc,
+      "after_acc_hash" => batch.after_acc
     }
     |> add_l1_transaction_info(batch)
     |> add_da_info(batch)
@@ -228,14 +234,14 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   """
   @spec extend_transaction_json_response(map(), %{
           :__struct__ => Transaction,
-          :arbitrum_batch => any(),
-          :arbitrum_commitment_transaction => any(),
-          :arbitrum_confirmation_transaction => any(),
-          :arbitrum_message_to_l2 => any(),
-          :arbitrum_message_from_l2 => any(),
-          :gas_used_for_l1 => Decimal.t(),
-          :gas_used => Decimal.t(),
-          :gas_price => Wei.t(),
+          optional(:arbitrum_batch) => any(),
+          optional(:arbitrum_commitment_transaction) => any(),
+          optional(:arbitrum_confirmation_transaction) => any(),
+          optional(:arbitrum_message_to_l2) => any(),
+          optional(:arbitrum_message_from_l2) => any(),
+          optional(:gas_used_for_l1) => Decimal.t(),
+          optional(:gas_used) => Decimal.t(),
+          optional(:gas_price) => Wei.t(),
           optional(any()) => any()
         }) :: map()
   def extend_transaction_json_response(out_json, %Transaction{} = transaction) do
@@ -260,13 +266,12 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   """
   @spec extend_block_json_response(map(), %{
           :__struct__ => Block,
-          :arbitrum_batch => any(),
-          :arbitrum_commitment_transaction => any(),
-          :arbitrum_confirmation_transaction => any(),
-          :nonce => Hash.Nonce.t(),
-          :send_count => non_neg_integer(),
-          :send_root => Hash.Full.t(),
-          :l1_block_number => non_neg_integer(),
+          optional(:arbitrum_batch) => any(),
+          optional(:arbitrum_commitment_transaction) => any(),
+          optional(:arbitrum_confirmation_transaction) => any(),
+          optional(:send_count) => non_neg_integer(),
+          optional(:send_root) => Hash.Full.t(),
+          optional(:l1_block_number) => non_neg_integer(),
           optional(any()) => any()
         }) :: map()
   def extend_block_json_response(out_json, %Block{} = block) do
@@ -281,9 +286,9 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   # Augments an output JSON with settlement-related information such as batch number and L1 transaction details to JSON.
   @spec extend_with_settlement_info(map(), %{
           :__struct__ => Block | Transaction,
-          :arbitrum_batch => any(),
-          :arbitrum_commitment_transaction => any(),
-          :arbitrum_confirmation_transaction => any(),
+          optional(:arbitrum_batch) => any(),
+          optional(:arbitrum_commitment_transaction) => any(),
+          optional(:arbitrum_confirmation_transaction) => any(),
           optional(any()) => any()
         }) :: map()
   defp extend_with_settlement_info(out_json, arbitrum_entity) do
@@ -301,7 +306,7 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   # data is loaded.
   @spec get_batch_number(%{
           :__struct__ => Block | Transaction,
-          :arbitrum_batch => any(),
+          optional(:arbitrum_batch) => any(),
           optional(any()) => any()
         }) :: nil | non_neg_integer()
   defp get_batch_number(arbitrum_entity) do
@@ -316,7 +321,7 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   # if the batch data is loaded.
   @spec get_batch_data_container(%{
           :__struct__ => Block | Transaction,
-          :arbitrum_batch => any(),
+          optional(:arbitrum_batch) => any(),
           optional(any()) => any()
         }) :: nil | String.t()
   defp get_batch_data_container(arbitrum_entity) do
@@ -368,8 +373,9 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   # Adds data availability (DA) information to the given output JSON based on the batch container type.
   #
   # This function enriches the output JSON with data availability information based on
-  # the type of batch container. It handles different DA types, including AnyTrust and
-  # Celestia, and generates the appropriate DA data for inclusion in the output.
+  # the type of batch container. It handles different DA types, including AnyTrust,
+  # Celestia, and EigenDA, and generates the appropriate DA data for inclusion in the
+  # output.
   #
   # ## Parameters
   # - `out_json`: The initial JSON map to be enriched with DA information.
@@ -379,7 +385,7 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   # - An updated JSON map containing the data availability information.
   @spec add_da_info(map(), %{
           :__struct__ => L1Batch,
-          :batch_container => :in_anytrust | :in_celestia | atom() | nil,
+          :batch_container => :in_anytrust | :in_celestia | :in_eigenda | atom() | nil,
           :number => non_neg_integer(),
           optional(any()) => any()
         }) :: map()
@@ -389,6 +395,7 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
         nil -> %{"batch_data_container" => nil}
         :in_anytrust -> generate_anytrust_certificate(batch.number)
         :in_celestia -> generate_celestia_da_info(batch.number)
+        :in_eigenda -> generate_eigen_da_info(batch.number)
         value -> %{"batch_data_container" => to_string(value)}
       end
 
@@ -402,7 +409,7 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
     out = %{"batch_data_container" => "in_anytrust"}
 
     da_info =
-      with raw_info <- Reader.get_da_info_by_batch_number(batch_number),
+      with raw_info <- SettlementReader.get_da_info_by_batch_number(batch_number),
            false <- Enum.empty?(raw_info) do
         prepare_anytrust_certificate(raw_info)
       else
@@ -429,7 +436,7 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   #   members who guaranteed availability of data for the specified timeout.
   @spec prepare_anytrust_certificate(map()) :: map()
   defp prepare_anytrust_certificate(da_info) do
-    keyset = Reader.get_anytrust_keyset(da_info["keyset_hash"])
+    keyset = SettlementReader.get_anytrust_keyset(da_info["keyset_hash"])
 
     signers =
       if Enum.empty?(keyset) do
@@ -457,7 +464,7 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   defp generate_celestia_da_info(batch_number) do
     out = %{"batch_data_container" => "in_celestia"}
 
-    da_info = Reader.get_da_info_by_batch_number(batch_number)
+    da_info = SettlementReader.get_da_info_by_batch_number(batch_number)
 
     out
     |> Map.merge(%{
@@ -466,10 +473,24 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
     })
   end
 
+  # Generates EigenDA information for the given batch number.
+  @spec generate_eigen_da_info(non_neg_integer()) :: map()
+  defp generate_eigen_da_info(batch_number) do
+    out = %{"batch_data_container" => "in_eigenda"}
+
+    da_info = SettlementReader.get_da_info_by_batch_number(batch_number)
+
+    out
+    |> Map.merge(%{
+      "blob_header" => Map.get(da_info, "blob_header"),
+      "blob_verification_proof" => Map.get(da_info, "blob_verification_proof")
+    })
+  end
+
   # Augments an output JSON with commit and confirm transaction details and their statuses.
   @spec add_l1_transactions_info_and_status(map(), %{
-          :commitment_transaction => any(),
-          :confirmation_transaction => any(),
+          optional(:commitment_transaction) => any(),
+          optional(:confirmation_transaction) => any(),
           optional(:batch_number) => any()
         }) :: map()
   defp add_l1_transactions_info_and_status(out_json, arbitrum_item)
@@ -503,8 +524,8 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   # ## Returns
   # A map containing nesting maps describing corresponding L1 transactions
   @spec get_associated_l1_transactions(%{
-          :commitment_transaction => any(),
-          :confirmation_transaction => any(),
+          optional(:commitment_transaction) => any(),
+          optional(:confirmation_transaction) => any(),
           optional(any()) => any()
         }) :: %{
           :commitment_transaction =>
@@ -556,8 +577,8 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   # ## Returns
   # A string with one of predefined statuses
   @spec block_or_transaction_status(%{
-          :commitment_transaction => any(),
-          :confirmation_transaction => any(),
+          optional(:commitment_transaction) => any(),
+          optional(:confirmation_transaction) => any(),
           optional(:batch_number) => any()
         }) :: String.t()
   defp block_or_transaction_status(arbitrum_item) do
@@ -581,8 +602,8 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   #   and the associated L1 transaction.
   @spec extend_if_message(map(), %{
           :__struct__ => Transaction,
-          :arbitrum_message_to_l2 => any(),
-          :arbitrum_message_from_l2 => any(),
+          optional(:arbitrum_message_to_l2) => any(),
+          optional(:arbitrum_message_from_l2) => any(),
           optional(any()) => any()
         }) :: map()
   defp extend_if_message(arbitrum_json, %Transaction{} = arbitrum_transaction) do
@@ -610,8 +631,8 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   @spec l1_transaction_and_status_for_message(
           %{
             :__struct__ => Transaction,
-            :arbitrum_message_to_l2 => any(),
-            :arbitrum_message_from_l2 => any(),
+            optional(:arbitrum_message_to_l2) => any(),
+            optional(:arbitrum_message_from_l2) => any(),
             optional(any()) => any()
           },
           :incoming | :outcoming
@@ -648,7 +669,7 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
 
     %{
       "message_id" => APIV2Helper.get_2map_data(arbitrum_transaction, :arbitrum_message_from_l2, :message_id),
-      "associated_l1_transaction" => l1_transaction,
+      "associated_l1_transaction_hash" => l1_transaction,
       "message_status" => status
     }
   end
@@ -656,19 +677,17 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   # Extends the output JSON with information from Arbitrum-specific fields of the transaction.
   @spec extend_with_transaction_info(map(), %{
           :__struct__ => Transaction,
-          :gas_used_for_l1 => Decimal.t(),
-          :gas_used => Decimal.t(),
-          :gas_price => Wei.t(),
+          optional(:gas_used_for_l1) => Decimal.t(),
           optional(any()) => any()
         }) :: map()
   defp extend_with_transaction_info(out_json, %Transaction{} = arbitrum_transaction) do
     # Map.get is only needed for the case when the module is compiled with
     # chain_type different from "arbitrum", `|| 0` is used to avoid nil values
     # for the transaction prior to the migration to Arbitrum specific BS build.
-    gas_used_for_l1 = Map.get(arbitrum_transaction, :gas_used_for_l1, 0) || 0
+    gas_used_for_l1 = Map.get(arbitrum_transaction, :gas_used_for_l1) || Decimal.new(0)
 
-    gas_used = Map.get(arbitrum_transaction, :gas_used, 0) || 0
-    gas_price = Map.get(arbitrum_transaction, :gas_price, 0) || 0
+    gas_used = Map.get(arbitrum_transaction, :gas_used) || Decimal.new(0)
+    gas_price = Map.get(arbitrum_transaction, :gas_price) || %Wei{value: Decimal.new(0)}
 
     gas_used_for_l2 =
       gas_used
@@ -694,16 +713,15 @@ defmodule BlockScoutWeb.API.V2.ArbitrumView do
   # Extends the output JSON with information from the Arbitrum-specific fields of the block.
   @spec extend_with_block_info(map(), %{
           :__struct__ => Block,
-          :nonce => Hash.Nonce.t(),
-          :send_count => non_neg_integer(),
-          :send_root => Hash.Full.t(),
-          :l1_block_number => non_neg_integer(),
+          optional(:send_count) => non_neg_integer(),
+          optional(:send_root) => Hash.Full.t(),
+          optional(:l1_block_number) => non_neg_integer(),
           optional(any()) => any()
         }) :: map()
   defp extend_with_block_info(out_json, %Block{} = arbitrum_block) do
     out_json
     |> Map.put("delayed_messages", Hash.to_integer(arbitrum_block.nonce))
-    |> Map.put("l1_block_height", Map.get(arbitrum_block, :l1_block_number))
+    |> Map.put("l1_block_number", Map.get(arbitrum_block, :l1_block_number))
     |> Map.put("send_count", Map.get(arbitrum_block, :send_count))
     |> Map.put("send_root", Map.get(arbitrum_block, :send_root))
   end

@@ -64,11 +64,12 @@ defmodule Explorer.Chain.Import.Runner.SignedAuthorizations do
   defp insert(repo, changes_list, %{timeout: timeout, timestamps: timestamps} = options) when is_list(changes_list) do
     on_conflict = Map.get_lazy(options, :on_conflict, &default_on_conflict/0)
     conflict_target = [:transaction_hash, :index]
+    ordered_changes_list = Enum.sort_by(changes_list, &{&1.transaction_hash, &1.index})
 
     {:ok, _} =
       Import.insert_changes_list(
         repo,
-        changes_list,
+        ordered_changes_list,
         for: SignedAuthorization,
         on_conflict: on_conflict,
         conflict_target: conflict_target,
@@ -90,20 +91,22 @@ defmodule Explorer.Chain.Import.Runner.SignedAuthorizations do
           s: fragment("EXCLUDED.s"),
           v: fragment("EXCLUDED.v"),
           authority: fragment("EXCLUDED.authority"),
+          status: fragment("EXCLUDED.status"),
           inserted_at: fragment("LEAST(?, EXCLUDED.inserted_at)", authorization.inserted_at),
           updated_at: fragment("GREATEST(?, EXCLUDED.updated_at)", authorization.updated_at)
         ]
       ],
       where:
         fragment(
-          "(EXCLUDED.chain_id, EXCLUDED.address, EXCLUDED.nonce, EXCLUDED.r, EXCLUDED.s, EXCLUDED.v, EXCLUDED.authority) IS DISTINCT FROM (?, ?, ?, ?, ?, ?, ?)",
+          "(EXCLUDED.chain_id, EXCLUDED.address, EXCLUDED.nonce, EXCLUDED.r, EXCLUDED.s, EXCLUDED.v, EXCLUDED.authority, EXCLUDED.status) IS DISTINCT FROM (?, ?, ?, ?, ?, ?, ?, ?)",
           authorization.chain_id,
           authorization.address,
           authorization.nonce,
           authorization.r,
           authorization.s,
           authorization.v,
-          authorization.authority
+          authorization.authority,
+          authorization.status
         )
     )
   end

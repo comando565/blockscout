@@ -5,22 +5,42 @@ defmodule Indexer.Transform.TokenTransfers do
 
   require Logger
 
-  import Explorer.Chain.SmartContract, only: [burn_address_hash_string: 0]
-  import Explorer.Helper, only: [truncate_address_hash: 1]
+  use Utils.RuntimeEnvHelper,
+    chain_type: [:explorer, :chain_type],
+    arc_native_token_address: [:indexer, [:arc, :arc_native_token_address]],
+    arc_native_token_system_address: [:indexer, [:arc, :arc_native_token_system_address]],
+    arc_native_token_decimals: [:indexer, [:arc, :arc_native_token_decimals]]
 
-  alias Explorer.{Helper, Repo}
+  import Explorer.Chain.SmartContract, only: [burn_address_hash_string: 0]
+  import Explorer.Helper, only: [decode_data: 2, truncate_address_hash: 1]
+
   alias Explorer.Chain.{Hash, Token, TokenTransfer}
+  alias Explorer.Repo
   alias Indexer.Fetcher.TokenTotalSupplyUpdater
 
   @doc """
   Returns a list of token transfers given a list of logs.
   """
-  def parse(logs) do
+  def parse(logs, skip_additional_fetchers? \\ false) do
     initial_acc = %{tokens: [], token_transfers: []}
 
+    erc20_and_erc721_token_transfers_filtered =
+      if chain_type() == :arc do
+        allowed_erc20_erc721_token_transfer_events =
+          [
+            TokenTransfer.constant(),
+            TokenTransfer.arc_native_coin_transferred_event(),
+            TokenTransfer.arc_native_coin_minted_event(),
+            TokenTransfer.arc_native_coin_burned_event()
+          ]
+
+        Enum.filter(logs, &(&1.first_topic in allowed_erc20_erc721_token_transfer_events))
+      else
+        Enum.filter(logs, &(&1.first_topic == unquote(TokenTransfer.constant())))
+      end
+
     erc20_and_erc721_token_transfers =
-      logs
-      |> Enum.filter(&(&1.first_topic == unquote(TokenTransfer.constant())))
+      erc20_and_erc721_token_transfers_filtered
       |> Enum.reduce(initial_acc, &do_parse/2)
 
     weth_transfers =
@@ -62,9 +82,11 @@ defmodule Indexer.Transform.TokenTransfers do
     tokens = sanitize_token_types(rough_tokens, rough_token_transfers)
     token_transfers = sanitize_weth_transfers(tokens, rough_token_transfers, weth_transfers.token_transfers)
 
-    token_transfers
-    |> filter_tokens_for_supply_update()
-    |> TokenTotalSupplyUpdater.add_tokens()
+    if !skip_additional_fetchers? do
+      token_transfers
+      |> filter_tokens_for_supply_update()
+      |> TokenTotalSupplyUpdater.add_tokens()
+    end
 
     tokens_uniq = tokens |> Enum.uniq()
 
@@ -209,59 +231,89 @@ defmodule Indexer.Transform.TokenTransfers do
   # ERC-20 token transfer
   defp parse_params(%{second_topic: second_topic, third_topic: third_topic, fourth_topic: nil} = log)
        when not is_nil(second_topic) and not is_nil(third_topic) do
-    [amount] = Helper.decode_data(log.data, [{:uint, 256}])
+    if arc_native_token_transfer_event?(log) do
+      # for :arc chain type we need to ignore ERC-20 Transfer events from the native token as there are
+      # NativeCoinTransferred, NativeCoinMinted, NativeCoinBurned events instead
+      nil
+    else
+      # handle the transfer for other cases
+      [decoded_amount] = decode_data(log.data, [{:uint, 256}])
+      decimal_amount = Decimal.new(decoded_amount || 0)
 
-    from_address_hash = truncate_address_hash(log.second_topic)
-    to_address_hash = truncate_address_hash(log.third_topic)
+      {token_contract_address_hash, amount} =
+        if arc_native_coin_transferred_event?(log) do
+          # if this is NativeCoinTransferred event for Arc chain, there are 18 decimals for the native token, so we need to adjust the amount with the token decimals
+          {arc_native_token_address(), amount_18_decimals_to_n_decimals(decimal_amount, arc_native_token_decimals())}
+        else
+          {log.address_hash, decimal_amount}
+        end
 
-    token_transfer = %{
-      amount: Decimal.new(amount || 0),
-      block_number: log.block_number,
-      block_hash: log.block_hash,
-      log_index: log.index,
-      from_address_hash: from_address_hash,
-      to_address_hash: to_address_hash,
-      token_contract_address_hash: log.address_hash,
-      transaction_hash: log.transaction_hash,
-      token_ids: nil,
-      token_type: "ERC-20"
-    }
+      token_transfer = %{
+        amount: amount,
+        block_number: log.block_number,
+        block_hash: log.block_hash,
+        log_index: log.index,
+        from_address_hash: truncate_address_hash(log.second_topic),
+        to_address_hash: truncate_address_hash(log.third_topic),
+        token_contract_address_hash: token_contract_address_hash,
+        transaction_hash: log.transaction_hash,
+        token_ids: nil,
+        token_type: "ERC-20"
+      }
 
-    token = %{
-      contract_address_hash: log.address_hash,
-      type: "ERC-20"
-    }
+      token = %{
+        contract_address_hash: token_contract_address_hash,
+        type: "ERC-20"
+      }
 
-    {token, token_transfer}
+      {token, token_transfer}
+    end
   end
 
-  # ERC-20 token transfer for WETH
+  # ERC-20 token transfer for WETH or Arc native token mint/burn
   defp parse_params(%{second_topic: second_topic, third_topic: nil, fourth_topic: nil} = log)
        when not is_nil(second_topic) do
-    [amount] = Helper.decode_data(log.data, [{:uint, 256}])
+    [decoded_amount] = decode_data(log.data, [{:uint, 256}])
+    decimal_amount = Decimal.new(decoded_amount || 0)
 
-    {from_address_hash, to_address_hash} =
-      if log.first_topic == TokenTransfer.weth_deposit_signature() do
-        {burn_address_hash_string(), truncate_address_hash(log.second_topic)}
-      else
-        {truncate_address_hash(log.second_topic), burn_address_hash_string()}
+    {from_address_hash, to_address_hash, token_contract_address_hash, amount} =
+      cond do
+        log.first_topic == TokenTransfer.weth_deposit_signature() ->
+          {burn_address_hash_string(), truncate_address_hash(log.second_topic), log.address_hash, decimal_amount}
+
+        arc_native_coin_minted_event?(log) ->
+          # there are 18 decimals for the native token, so we need to adjust the amount with the token decimals
+          normalized_amount = amount_18_decimals_to_n_decimals(decimal_amount, arc_native_token_decimals())
+
+          {burn_address_hash_string(), truncate_address_hash(log.second_topic), arc_native_token_address(),
+           normalized_amount}
+
+        arc_native_coin_burned_event?(log) ->
+          # there are 18 decimals for the native token, so we need to adjust the amount with the token decimals
+          normalized_amount = amount_18_decimals_to_n_decimals(decimal_amount, arc_native_token_decimals())
+
+          {truncate_address_hash(log.second_topic), burn_address_hash_string(), arc_native_token_address(),
+           normalized_amount}
+
+        true ->
+          {truncate_address_hash(log.second_topic), burn_address_hash_string(), log.address_hash, decimal_amount}
       end
 
     token_transfer = %{
-      amount: Decimal.new(amount || 0),
+      amount: amount,
       block_number: log.block_number,
       block_hash: log.block_hash,
       log_index: log.index,
       from_address_hash: from_address_hash,
       to_address_hash: to_address_hash,
-      token_contract_address_hash: log.address_hash,
+      token_contract_address_hash: token_contract_address_hash,
       transaction_hash: log.transaction_hash,
       token_ids: nil,
       token_type: "ERC-20"
     }
 
     token = %{
-      contract_address_hash: log.address_hash,
+      contract_address_hash: token_contract_address_hash,
       type: "ERC-20"
     }
 
@@ -271,7 +323,7 @@ defmodule Indexer.Transform.TokenTransfers do
   # ERC-721 token transfer with topics as addresses
   defp parse_params(%{second_topic: second_topic, third_topic: third_topic, fourth_topic: fourth_topic} = log)
        when not is_nil(second_topic) and not is_nil(third_topic) and not is_nil(fourth_topic) do
-    [token_id] = Helper.decode_data(fourth_topic, [{:uint, 256}])
+    [token_id] = decode_data(fourth_topic, [{:uint, 256}])
 
     from_address_hash = truncate_address_hash(log.second_topic)
     to_address_hash = truncate_address_hash(log.third_topic)
@@ -306,14 +358,14 @@ defmodule Indexer.Transform.TokenTransfers do
          } = log
        )
        when not is_nil(data) do
-    [from_address_hash, to_address_hash, token_id] = Helper.decode_data(data, [:address, :address, {:uint, 256}])
+    [from_address_hash, to_address_hash, token_id] = decode_data(data, [:address, :address, {:uint, 256}])
 
     token_transfer = %{
       block_number: log.block_number,
       block_hash: log.block_hash,
       log_index: log.index,
-      from_address_hash: encode_address_hash(from_address_hash),
-      to_address_hash: encode_address_hash(to_address_hash),
+      from_address_hash: "0x" <> Base.encode16(from_address_hash, case: :lower),
+      to_address_hash: "0x" <> Base.encode16(to_address_hash, case: :lower),
       token_contract_address_hash: log.address_hash,
       token_ids: [token_id],
       transaction_hash: log.transaction_hash,
@@ -342,7 +394,7 @@ defmodule Indexer.Transform.TokenTransfers do
            data: data
          } = log
        ) do
-    [token_ids, values] = Helper.decode_data(data, [{:array, {:uint, 256}}, {:array, {:uint, 256}}])
+    [token_ids, values] = decode_data(data, [{:array, {:uint, 256}}, {:array, {:uint, 256}}])
 
     if is_nil(token_ids) or token_ids == [] or is_nil(values) or values == [] do
       nil
@@ -373,7 +425,7 @@ defmodule Indexer.Transform.TokenTransfers do
   end
 
   defp parse_erc1155_params(%{third_topic: third_topic, fourth_topic: fourth_topic, data: data} = log) do
-    [token_id, value] = Helper.decode_data(data, [{:uint, 256}, {:uint, 256}])
+    [token_id, value] = decode_data(data, [{:uint, 256}, {:uint, 256}])
 
     from_address_hash = truncate_address_hash(third_topic)
     to_address_hash = truncate_address_hash(fourth_topic)
@@ -414,7 +466,7 @@ defmodule Indexer.Transform.TokenTransfers do
            data: data
          } = log
        ) do
-    [value] = Helper.decode_data(data, [{:uint, 256}])
+    [value] = decode_data(data, [{:uint, 256}])
 
     if is_nil(value) or value == [] do
       nil
@@ -450,7 +502,7 @@ defmodule Indexer.Transform.TokenTransfers do
            data: _data
          } = log
        ) do
-    [token_id] = Helper.decode_data(fourth_topic, [{:uint, 256}])
+    [token_id] = decode_data(fourth_topic, [{:uint, 256}])
 
     if is_nil(token_id) or token_id == [] do
       nil
@@ -477,6 +529,90 @@ defmodule Indexer.Transform.TokenTransfers do
     end
   end
 
+  # Converts from 18-decimal amount to n-decimal amount.
+  #
+  # ## Parameters
+  # - `amount`: The given 18-decimal amount to convert from.
+  # - `new_decimals`: The new number of decimals.
+  #
+  # ## Returns
+  # - The converted amount. If the source amount has more than `new_decimals` decimals, the new amount will be truncated.
+  #   Example: If we have 18-decimal amount 25148712000000000, that will be 25148 for 6-decimal representation.
+  @spec amount_18_decimals_to_n_decimals(Decimal.t(), non_neg_integer()) :: Decimal.t()
+  defp amount_18_decimals_to_n_decimals(amount, new_decimals) do
+    amount
+    |> Decimal.mult(Integer.pow(10, new_decimals))
+    |> Decimal.div_int(Integer.pow(10, 18))
+  end
+
+  # Determines if the given log is the NativeCoinTransferred event emitted by the native token system address on Arc chain.
+  #
+  # ## Parameters
+  # - `log`: The log to check.
+  #
+  # ## Returns
+  # - `true` if this is the NativeCoinTransferred event from the native token system address on Arc chain, `false` otherwise.
+  @spec arc_native_coin_transferred_event?(%{
+          :first_topic => String.t(),
+          :address_hash => String.t(),
+          optional(any()) => any()
+        }) :: boolean()
+  defp arc_native_coin_transferred_event?(log) do
+    chain_type() == :arc and log.first_topic == TokenTransfer.arc_native_coin_transferred_event() and
+      log.address_hash == arc_native_token_system_address()
+  end
+
+  # Determines if the given log is the NativeCoinMinted event emitted by the native token system address on Arc chain.
+  #
+  # ## Parameters
+  # - `log`: The log to check.
+  #
+  # ## Returns
+  # - `true` if this is the NativeCoinMinted event from the native token system address on Arc chain, `false` otherwise.
+  @spec arc_native_coin_minted_event?(%{
+          :first_topic => String.t(),
+          :address_hash => String.t(),
+          optional(any()) => any()
+        }) :: boolean()
+  defp arc_native_coin_minted_event?(log) do
+    chain_type() == :arc and log.first_topic == TokenTransfer.arc_native_coin_minted_event() and
+      log.address_hash == arc_native_token_system_address()
+  end
+
+  # Determines if the given log is the NativeCoinBurned event emitted by the native token system address on Arc chain.
+  #
+  # ## Parameters
+  # - `log`: The log to check.
+  #
+  # ## Returns
+  # - `true` if this is the NativeCoinBurned event from the native token system address on Arc chain, `false` otherwise.
+  @spec arc_native_coin_burned_event?(%{
+          :first_topic => String.t(),
+          :address_hash => String.t(),
+          optional(any()) => any()
+        }) :: boolean()
+  defp arc_native_coin_burned_event?(log) do
+    chain_type() == :arc and log.first_topic == TokenTransfer.arc_native_coin_burned_event() and
+      log.address_hash == arc_native_token_system_address()
+  end
+
+  # Determines if the given log is the Transfer event emitted by the native token contract on Arc chain.
+  #
+  # ## Parameters
+  # - `log`: The log to check.
+  #
+  # ## Returns
+  # - `true` if this is the Transfer event from the native token contract on Arc chain, `false` otherwise.
+  @spec arc_native_token_transfer_event?(%{
+          :first_topic => String.t(),
+          :address_hash => String.t(),
+          optional(any()) => any()
+        }) :: boolean()
+  defp arc_native_token_transfer_event?(log) do
+    chain_type() == :arc and log.first_topic == TokenTransfer.constant() and
+      log.address_hash == arc_native_token_address()
+  end
+
   def filter_tokens_for_supply_update(token_transfers) do
     token_transfers
     |> Enum.filter(fn token_transfer ->
@@ -485,9 +621,5 @@ defmodule Indexer.Transform.TokenTransfers do
     end)
     |> Enum.map(& &1.token_contract_address_hash)
     |> Enum.uniq()
-  end
-
-  defp encode_address_hash(binary) do
-    "0x" <> Base.encode16(binary, case: :lower)
   end
 end

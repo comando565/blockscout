@@ -26,7 +26,9 @@ defmodule BlockScoutWeb.API.V2.Proxy.AccountAbstractionController do
   @spec summary(Plug.Conn.t(), map()) ::
           {:error | :format | :transaction_interpreter_enabled | non_neg_integer(), any()} | Plug.Conn.t()
   def summary(conn, %{"operation_hash_param" => operation_hash_string, "just_request_body" => "true"}) do
-    with {:format, {:ok, _operation_hash}} <- {:format, Chain.string_to_transaction_hash(operation_hash_string)},
+    with {:format, {:ok, _operation_hash}} <- {:format, Chain.string_to_full_hash(operation_hash_string)},
+         {:transaction_interpreter_enabled, true} <-
+           {:transaction_interpreter_enabled, TransactionInterpretationService.enabled?()},
          {200, %{"hash" => _} = user_op} <- AccountAbstraction.get_user_ops_by_hash(operation_hash_string) do
       conn
       |> json(TransactionInterpretationService.get_user_op_request_body(user_op))
@@ -34,7 +36,7 @@ defmodule BlockScoutWeb.API.V2.Proxy.AccountAbstractionController do
   end
 
   def summary(conn, %{"operation_hash_param" => operation_hash_string}) do
-    with {:format, {:ok, _operation_hash}} <- {:format, Chain.string_to_transaction_hash(operation_hash_string)},
+    with {:format, {:ok, _operation_hash}} <- {:format, Chain.string_to_full_hash(operation_hash_string)},
          {:transaction_interpreter_enabled, true} <-
            {:transaction_interpreter_enabled, TransactionInterpretationService.enabled?()},
          {200, %{"hash" => _} = user_op} <- AccountAbstraction.get_user_ops_by_hash(operation_hash_string) do
@@ -151,6 +153,16 @@ defmodule BlockScoutWeb.API.V2.Proxy.AccountAbstractionController do
     |> process_response(conn)
   end
 
+  @doc """
+    Function to handle GET requests to `/api/v2/proxy/account-abstraction/status` endpoint.
+  """
+  @spec status(Plug.Conn.t(), map()) :: Plug.Conn.t() | {atom(), any()}
+  def status(conn, params) do
+    params
+    |> AccountAbstraction.get_status()
+    |> process_response(conn)
+  end
+
   defp extended_info(response) do
     address_hashes =
       response
@@ -181,12 +193,7 @@ defmodule BlockScoutWeb.API.V2.Proxy.AccountAbstractionController do
     address_hash_strings
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq()
-    |> Enum.map(fn hash_string ->
-      case Chain.string_to_address_hash(hash_string) do
-        {:ok, hash} -> hash
-        _ -> nil
-      end
-    end)
+    |> Enum.map(&Chain.string_to_address_hash_or_nil/1)
     |> Enum.reject(&is_nil/1)
   end
 

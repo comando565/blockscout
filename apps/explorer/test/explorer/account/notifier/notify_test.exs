@@ -44,7 +44,7 @@ defmodule Explorer.Account.Notifier.NotifyTest do
 
       wn =
         WatchlistNotification
-        |> first
+        |> first()
         |> Repo.account_repo().one()
 
       assert notify == [[:ok]]
@@ -74,7 +74,7 @@ defmodule Explorer.Account.Notifier.NotifyTest do
 
       wn =
         WatchlistNotification
-        |> first
+        |> first()
         |> Repo.account_repo().one()
 
       assert notify == [[:ok]]
@@ -113,7 +113,7 @@ defmodule Explorer.Account.Notifier.NotifyTest do
 
       wn =
         WatchlistNotification
-        |> first
+        |> first()
         |> Repo.account_repo().one()
 
       assert notify == [[:ok]]
@@ -137,10 +137,38 @@ defmodule Explorer.Account.Notifier.NotifyTest do
       Notify.call([transaction])
 
       WatchlistNotification
-      |> first
+      |> first()
       |> Repo.account_repo().one!()
 
       Application.put_env(:explorer, Explorer.Account, old_envs)
+    end
+
+    test "ignore events older than 24 hrs" do
+      wa =
+        %WatchlistAddress{address_hash: address_hash} =
+        build(:account_watchlist_address, watch_coin_input: true)
+        |> Repo.account_repo().insert!()
+
+      _watchlist_address = Repo.preload(wa, watchlist: :identity)
+
+      transaction =
+        %Transaction{
+          from_address: _from_address,
+          to_address: _to_address,
+          block_number: _block_number,
+          hash: _transaction_hash
+        } =
+        with_block(
+          insert(:transaction, to_address: %Chain.Address{hash: address_hash}),
+          insert(:block, timestamp: DateTime.add(DateTime.utc_now(), -25, :hour))
+        )
+
+      notify = Notify.call([transaction])
+
+      assert WatchlistNotification
+             |> Repo.account_repo().all() == []
+
+      assert notify == [nil]
     end
   end
 end

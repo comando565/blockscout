@@ -45,7 +45,7 @@ defmodule Indexer.Fetcher.BlockReward do
   def child_spec([init_options, gen_server_options]) do
     {state, mergeable_init_options} = Keyword.pop(init_options, :json_rpc_named_arguments)
 
-    unless state do
+    if !state do
       raise ArgumentError,
             ":json_rpc_named_arguments must be provided to `#{__MODULE__}.child_spec " <>
               "to allow for json_rpc calls when running."
@@ -192,7 +192,7 @@ defmodule Indexer.Fetcher.BlockReward do
       |> Chain.timestamp_by_block_hash()
 
     Enum.map(beneficiaries_params, fn %{block_hash: block_hash_str} = beneficiary ->
-      {:ok, block_hash} = Chain.string_to_block_hash(block_hash_str)
+      {:ok, block_hash} = Chain.string_to_full_hash(block_hash_str)
 
       case timestamp_by_block_hash do
         %{^block_hash => block_timestamp} ->

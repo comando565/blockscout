@@ -5,9 +5,9 @@ defmodule Explorer.Chain.Blackfort.Validator do
 
   use Explorer.Schema
 
+  alias Explorer.{Chain, Helper, HttpClient, Repo, SortingHelper}
   alias Explorer.Chain.{Address, Import}
   alias Explorer.Chain.Hash.Address, as: HashAddress
-  alias Explorer.{Chain, Repo, SortingHelper}
 
   require Logger
 
@@ -145,9 +145,14 @@ defmodule Explorer.Chain.Blackfort.Validator do
   """
   @spec fetch_validators_list() :: {:ok, list()} | :error
   def fetch_validators_list do
-    case HTTPoison.get(validator_url(), [], follow_redirect: true) do
-      {:ok, %HTTPoison.Response{status_code: 200, body: body}} ->
-        body |> Jason.decode() |> parse_validators_info()
+    url = validator_url()
+
+    with {:url, true} <- {:url, Helper.valid_url?(url)},
+         {:ok, %{status_code: 200, body: body}} <- HttpClient.get(validator_url(), [], follow_redirect: true) do
+      body |> Jason.decode() |> parse_validators_info()
+    else
+      {:url, false} ->
+        :error
 
       error ->
         Logger.error("Failed to fetch blackfort validator info: #{inspect(error)}")

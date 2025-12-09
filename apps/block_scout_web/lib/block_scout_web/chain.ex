@@ -2,17 +2,18 @@ defmodule BlockScoutWeb.Chain do
   @moduledoc """
   Converts the `param` to the corresponding resource that uses that format of param.
   """
+  use Utils.CompileTimeEnvHelper, chain_type: [:explorer, :chain_type]
 
   import Explorer.Chain,
     only: [
-      find_or_insert_address_from_hash: 1,
       hash_to_block: 1,
       hash_to_transaction: 1,
       number_to_block: 1,
       string_to_address_hash: 1,
-      string_to_block_hash: 1,
-      string_to_transaction_hash: 1
+      string_to_full_hash: 1
     ]
+
+  import Explorer.Chain.SmartContract.Proxy.Models.Implementation, only: [proxy_implementations_association: 0]
 
   import Explorer.PagingOptions,
     only: [
@@ -20,7 +21,9 @@ defmodule BlockScoutWeb.Chain do
       page_size: 0
     ]
 
-  import Explorer.Helper, only: [parse_integer: 1]
+  import BlockScoutWeb.PagingHelper, only: [delete_parameters_from_next_page_params: 1]
+
+  import Explorer.Helper, only: [parse_boolean: 1, parse_integer: 1]
 
   alias BlockScoutWeb.PagingHelper
   alias Ecto.Association.NotLoaded
@@ -45,24 +48,19 @@ defmodule BlockScoutWeb.Chain do
     Transaction,
     Transaction.StateChange,
     UserOperation,
-    Wei
+    Wei,
+    Withdrawal
   }
 
   alias Explorer.Chain.Optimism.Deposit, as: OptimismDeposit
   alias Explorer.Chain.Optimism.FrameSequence, as: OptimismFrameSequence
+  alias Explorer.Chain.Optimism.InteropMessage, as: OptimismInteropMessage
   alias Explorer.Chain.Optimism.OutputRoot, as: OptimismOutputRoot
   alias Explorer.Chain.Scroll.Bridge, as: ScrollBridge
-
-  alias Explorer.PagingOptions
-
-  defimpl Poison.Encoder, for: Decimal do
-    def encode(value, _opts) do
-      # silence the xref warning
-      decimal = Decimal
-
-      [?\", decimal.to_string(value), ?\"]
-    end
-  end
+  alias Explorer.{Etherscan, PagingOptions}
+  alias Explorer.Migrator.DeleteZeroValueInternalTransactions
+  alias Indexer.Fetcher.OnDemand.InternalTransaction, as: InternalTransactionOnDemand
+  alias Plug.Conn
 
   @page_size page_size()
   @default_paging_options default_paging_options()
@@ -71,7 +69,7 @@ defmodule BlockScoutWeb.Chain do
 
   def current_filter(%{paging_options: paging_options} = params) do
     params
-    |> Map.get("filter")
+    |> (&(Map.get(&1, "filter") || Map.get(&1, :filter))).()
     |> case do
       "to" -> [direction: :to, paging_options: paging_options]
       "from" -> [direction: :from, paging_options: paging_options]
@@ -81,7 +79,7 @@ defmodule BlockScoutWeb.Chain do
 
   def current_filter(params) do
     params
-    |> Map.get("filter")
+    |> (&(Map.get(&1, "filter") || Map.get(&1, :filter))).()
     |> case do
       "to" -> [direction: :to]
       "from" -> [direction: :from]
@@ -105,33 +103,104 @@ defmodule BlockScoutWeb.Chain do
   def from_param(param) when byte_size(param) == @full_hash_len,
     do: block_or_transaction_or_operation_or_blob_from_param("0x" <> param)
 
-  def from_param(string) when is_binary(string) do
-    case param_to_block_number(string) do
-      {:ok, number} -> number_to_block(number)
-      _ -> search_ens_domain(string)
+  if @chain_type == :filecoin do
+    def from_param(string) when is_binary(string) do
+      case param_to_block_number(string) do
+        {:ok, number} ->
+          number_to_block(number)
+
+        _ ->
+          case Search.maybe_parse_filecoin_address(string) do
+            {:ok, filecoin_address} ->
+              result =
+                filecoin_address
+                |> Search.address_by_filecoin_id_or_robust()
+                # credo:disable-for-next-line Credo.Check.Design.AliasUsage
+                |> Explorer.Chain.select_repo(api?: true).one()
+
+              (result && {:ok, result}) || {:error, :not_found}
+
+            _ ->
+              search_ens_domain(string)
+          end
+      end
+    end
+  else
+    def from_param(string) when is_binary(string) do
+      case param_to_block_number(string) do
+        {:ok, number} ->
+          number_to_block(number)
+
+        _ ->
+          search_ens_domain(string)
+      end
     end
   end
 
-  @spec next_page_params(any, list(), map(), (any -> map())) :: nil | map
-  def next_page_params(next_page, list, params, paging_function \\ &paging_params/1)
+  @spec next_page_params(any, list(), map(), bool(), (any -> map())) :: nil | map
+  def next_page_params(next_page, list, params, increment_items_count? \\ false, paging_function \\ &paging_params/1)
 
-  def next_page_params([], _list, _params, _), do: nil
+  def next_page_params([], _list, _params, _increment_items_count?, _), do: nil
 
-  def next_page_params(_, list, params, paging_function) do
+  def next_page_params(_, list, params, increment_items_count?, paging_function) do
     paging_params = paging_function.(List.last(list))
 
-    next_page_params = Map.merge(params, paging_params)
-    current_items_count_string = Map.get(next_page_params, "items_count")
+    string_keys = map_to_string_keys(paging_params)
 
-    items_count =
-      if is_binary(current_items_count_string) do
-        {current_items_count, _} = Integer.parse(current_items_count_string)
-        current_items_count + Enum.count(list)
-      else
-        Enum.count(list)
+    next_page_params =
+      params
+      |> delete_parameters_from_next_page_params()
+      |> Map.drop(string_keys)
+      |> Map.merge(paging_params)
+
+    items_count = next_items_count(next_page_params, list, increment_items_count?)
+
+    cond do
+      Map.has_key?(next_page_params, "items_count") ->
+        Map.put(next_page_params, "items_count", items_count)
+
+      Map.has_key?(next_page_params, :items_count) ->
+        Map.put(next_page_params, :items_count, items_count)
+
+      true ->
+        Map.put(next_page_params, :items_count, items_count)
+    end
+  end
+
+  defp get_items_count_from_next_page_params(next_page_params) do
+    cond do
+      Map.has_key?(next_page_params, "items_count") ->
+        Map.get(next_page_params, "items_count")
+
+      Map.has_key?(next_page_params, :items_count) ->
+        Map.get(next_page_params, :items_count)
+
+      true ->
+        nil
+    end
+  end
+
+  defp next_items_count(_next_page_params, list, false) do
+    Enum.count(list)
+  end
+
+  defp next_items_count(next_page_params, list, true) do
+    current_items_count_object = get_items_count_from_next_page_params(next_page_params)
+
+    current_items_count =
+      cond do
+        is_binary(current_items_count_object) ->
+          {current_items_count, _} = Integer.parse(current_items_count_object)
+          current_items_count
+
+        is_integer(current_items_count_object) ->
+          current_items_count_object
+
+        true ->
+          0
       end
 
-    Map.put(next_page_params, "items_count", items_count)
+    current_items_count + Enum.count(list)
   end
 
   @doc """
@@ -140,62 +209,101 @@ defmodule BlockScoutWeb.Chain do
   """
   @spec paging_options(any) ::
           [{:paging_options, Explorer.PagingOptions.t()}, ...] | Explorer.PagingOptions.t()
-  def paging_options(%{"hash" => hash_string, "fetched_coin_balance" => fetched_coin_balance_string})
-      when is_binary(hash_string) and is_binary(fetched_coin_balance_string) do
-    with {coin_balance, ""} <- Integer.parse(fetched_coin_balance_string),
-         {:ok, address_hash} <- string_to_address_hash(hash_string) do
-      [paging_options: %{@default_paging_options | key: {%Wei{value: Decimal.new(coin_balance)}, address_hash}}]
-    else
+  # todo: function clause for the old UI, to be removed later
+  def paging_options(%{
+        "hash" => hash_string,
+        "fetched_coin_balance" => fetched_coin_balance_string,
+        "transactions_count" => transactions_count_string
+      })
+      when is_binary(hash_string) do
+    case string_to_address_hash(hash_string) do
+      {:ok, address_hash} ->
+        [
+          paging_options: %{
+            @default_paging_options
+            | key: %{
+                fetched_coin_balance: decimal_parse(fetched_coin_balance_string),
+                hash: address_hash,
+                transactions_count: parse_integer(transactions_count_string)
+              }
+          }
+        ]
+
       _ ->
         [paging_options: @default_paging_options]
     end
   end
 
   def paging_options(%{
-        "fee" => fee_string,
-        "value" => value_string,
-        "block_number" => block_number_string,
-        "index" => index_string,
-        "inserted_at" => inserted_at_string,
-        "hash" => hash_string
+        hash: hash_string,
+        fetched_coin_balance: fetched_coin_balance_string,
+        transactions_count: transactions_count_string
+      })
+      when is_binary(hash_string) do
+    case string_to_address_hash(hash_string) do
+      {:ok, address_hash} ->
+        [
+          paging_options: %{
+            @default_paging_options
+            | key: %{
+                fetched_coin_balance: decimal_parse(fetched_coin_balance_string),
+                hash: address_hash,
+                transactions_count: parse_integer(transactions_count_string)
+              }
+          }
+        ]
+
+      _ ->
+        [paging_options: @default_paging_options]
+    end
+  end
+
+  def paging_options(%{
+        fee: fee_string,
+        value: value_string,
+        block_number: block_number_string,
+        index: index_string,
+        inserted_at: inserted_at,
+        hash: hash_string
       }) do
-    with {:ok, hash} <- string_to_transaction_hash(hash_string),
-         {:ok, inserted_at, _} <- DateTime.from_iso8601(inserted_at_string) do
-      [
-        paging_options: %{
-          @default_paging_options
-          | key: %{
-              fee: decimal_parse(fee_string),
-              value: decimal_parse(value_string),
-              block_number: parse_integer(block_number_string),
-              index: parse_integer(index_string),
-              inserted_at: inserted_at,
-              hash: hash
-            }
-        }
-      ]
-    else
-      _ -> [paging_options: @default_paging_options]
+    case string_to_full_hash(hash_string) do
+      {:ok, hash} ->
+        [
+          paging_options: %{
+            @default_paging_options
+            | key: %{
+                fee: decimal_parse(fee_string),
+                value: decimal_parse(value_string),
+                block_number: parse_integer(block_number_string),
+                index: parse_integer(index_string),
+                inserted_at: inserted_at,
+                hash: hash
+              }
+          }
+        ]
+
+      _ ->
+        [paging_options: @default_paging_options]
     end
   end
 
   def paging_options(
         %{
           "market_cap" => market_cap_string,
-          "holder_count" => holder_count_string,
+          "holders_count" => holders_count_string,
           "name" => name_string,
           "contract_address_hash" => contract_address_hash_string,
-          "is_name_null" => is_name_null_string
+          "is_name_null" => is_name_null
         } = params
       )
-      when is_binary(market_cap_string) and is_binary(holder_count_string) and is_binary(name_string) and
-             is_binary(contract_address_hash_string) and is_binary(is_name_null_string) do
+      when is_binary(market_cap_string) and is_binary(holders_count_string) and is_binary(name_string) and
+             is_binary(contract_address_hash_string) do
     market_cap_decimal = decimal_parse(market_cap_string)
 
     fiat_value_decimal = decimal_parse(params["fiat_value"])
 
-    holder_count = parse_integer(holder_count_string)
-    token_name = if is_name_null_string == "true", do: nil, else: name_string
+    holders_count = parse_integer(holders_count_string)
+    token_name = if is_name_null, do: nil, else: name_string
 
     case Hash.Address.cast(contract_address_hash_string) do
       {:ok, contract_address_hash} ->
@@ -205,7 +313,45 @@ defmodule BlockScoutWeb.Chain do
             | key: %{
                 fiat_value: fiat_value_decimal,
                 circulating_market_cap: market_cap_decimal,
-                holder_count: holder_count,
+                holder_count: holders_count,
+                name: token_name,
+                contract_address_hash: contract_address_hash
+              }
+          }
+        ]
+
+      _ ->
+        [paging_options: @default_paging_options]
+    end
+  end
+
+  def paging_options(
+        %{
+          market_cap: market_cap_string,
+          holders_count: holders_count_string,
+          name: name_string,
+          contract_address_hash: contract_address_hash_string,
+          is_name_null: is_name_null
+        } = params
+      )
+      when is_binary(market_cap_string) and is_binary(holders_count_string) and is_binary(name_string) and
+             is_binary(contract_address_hash_string) do
+    market_cap_decimal = decimal_parse(market_cap_string)
+
+    fiat_value_decimal = decimal_parse(params[:fiat_value])
+
+    holders_count = parse_integer(holders_count_string)
+    token_name = if is_name_null, do: nil, else: name_string
+
+    case Hash.Address.cast(contract_address_hash_string) do
+      {:ok, contract_address_hash} ->
+        [
+          paging_options: %{
+            @default_paging_options
+            | key: %{
+                fiat_value: fiat_value_decimal,
+                circulating_market_cap: market_cap_decimal,
+                holder_count: holders_count,
                 name: token_name,
                 contract_address_hash: contract_address_hash
               }
@@ -234,6 +380,14 @@ defmodule BlockScoutWeb.Chain do
   end
 
   def paging_options(%{
+        block_number: block_number,
+        transaction_index: transaction_index,
+        index: index
+      }) do
+    [paging_options: %{@default_paging_options | key: {block_number, transaction_index, index}}]
+  end
+
+  def paging_options(%{
         "block_number" => block_number_string,
         "index" => index_string,
         "batch_log_index" => batch_log_index_string,
@@ -242,13 +396,13 @@ defmodule BlockScoutWeb.Chain do
         "index_in_batch" => index_in_batch_string
       })
       when is_binary(block_number_string) and is_binary(index_string) and is_binary(batch_log_index_string) and
-             is_binary(batch_transaction_hash_string) and is_binary(index_in_batch_string) and
+             is_binary(batch_block_hash_string) and is_binary(batch_transaction_hash_string) and
              is_binary(index_in_batch_string) do
     with {block_number, ""} <- Integer.parse(block_number_string),
          {index, ""} <- Integer.parse(index_string),
          {index_in_batch, ""} <- Integer.parse(index_in_batch_string),
-         {:ok, batch_transaction_hash} <- string_to_transaction_hash(batch_transaction_hash_string),
-         {:ok, batch_block_hash} <- string_to_block_hash(batch_block_hash_string),
+         {:ok, batch_transaction_hash} <- string_to_full_hash(batch_transaction_hash_string),
+         {:ok, batch_block_hash} <- string_to_full_hash(batch_block_hash_string),
          {batch_log_index, ""} <- Integer.parse(batch_log_index_string) do
       [
         paging_options: %{
@@ -272,9 +426,55 @@ defmodule BlockScoutWeb.Chain do
       when is_binary(batch_log_index_string) and is_binary(batch_block_hash_string) and
              is_binary(batch_transaction_hash_string) and is_binary(index_in_batch_string) do
     with {index_in_batch, ""} <- Integer.parse(index_in_batch_string),
-         {:ok, batch_transaction_hash} <- string_to_transaction_hash(batch_transaction_hash_string),
-         {:ok, batch_block_hash} <- string_to_block_hash(batch_block_hash_string),
+         {:ok, batch_transaction_hash} <- string_to_full_hash(batch_transaction_hash_string),
+         {:ok, batch_block_hash} <- string_to_full_hash(batch_block_hash_string),
          {batch_log_index, ""} <- Integer.parse(batch_log_index_string) do
+      [
+        paging_options: %{
+          @default_paging_options
+          | batch_key: {batch_block_hash, batch_transaction_hash, batch_log_index, index_in_batch}
+        }
+      ]
+    else
+      _ ->
+        [paging_options: @default_paging_options]
+    end
+  end
+
+  def paging_options(%{
+        block_number: block_number,
+        index: index,
+        batch_log_index: batch_log_index,
+        batch_block_hash: batch_block_hash_string,
+        batch_transaction_hash: batch_transaction_hash_string,
+        index_in_batch: index_in_batch
+      })
+      when is_binary(batch_transaction_hash_string) and is_binary(batch_block_hash_string) do
+    with {:ok, batch_transaction_hash} <- string_to_full_hash(batch_transaction_hash_string),
+         {:ok, batch_block_hash} <- string_to_full_hash(batch_block_hash_string) do
+      [
+        paging_options: %{
+          @default_paging_options
+          | key: {block_number, index},
+            batch_key: {batch_block_hash, batch_transaction_hash, batch_log_index, index_in_batch}
+        }
+      ]
+    else
+      _ ->
+        [paging_options: @default_paging_options]
+    end
+  end
+
+  def paging_options(%{
+        batch_log_index: batch_log_index,
+        batch_block_hash: batch_block_hash_string,
+        batch_transaction_hash: batch_transaction_hash_string,
+        index_in_batch: index_in_batch
+      })
+      when is_binary(batch_block_hash_string) and
+             is_binary(batch_transaction_hash_string) do
+    with {:ok, batch_transaction_hash} <- string_to_full_hash(batch_transaction_hash_string),
+         {:ok, batch_block_hash} <- string_to_full_hash(batch_block_hash_string) do
       [
         paging_options: %{
           @default_paging_options
@@ -298,6 +498,10 @@ defmodule BlockScoutWeb.Chain do
     end
   end
 
+  def paging_options(%{block_number: block_number, index: index}) do
+    [paging_options: %{@default_paging_options | key: {block_number, index}}]
+  end
+
   def paging_options(%{"block_number" => block_number_string}) when is_binary(block_number_string) do
     case Integer.parse(block_number_string) do
       {block_number, ""} ->
@@ -306,6 +510,30 @@ defmodule BlockScoutWeb.Chain do
       _ ->
         [paging_options: @default_paging_options]
     end
+  end
+
+  def paging_options(%{block_number: block_number}) do
+    [paging_options: %{@default_paging_options | key: {block_number}}]
+  end
+
+  def paging_options(%{"transaction_index" => transaction_index_string, "index" => index_string})
+      when is_binary(transaction_index_string) and is_binary(index_string) do
+    with {transaction_index, ""} <- Integer.parse(transaction_index_string),
+         {index, ""} <- Integer.parse(index_string) do
+      [paging_options: %{@default_paging_options | key: %{transaction_index: transaction_index, index: index}}]
+    else
+      _ ->
+        [paging_options: @default_paging_options]
+    end
+  end
+
+  def paging_options(%{"transaction_index" => transaction_index, "index" => index})
+      when is_integer(transaction_index) and is_integer(index) do
+    [paging_options: %{@default_paging_options | key: %{transaction_index: transaction_index, index: index}}]
+  end
+
+  def paging_options(%{transaction_index: transaction_index, index: index}) do
+    [paging_options: %{@default_paging_options | key: %{transaction_index: transaction_index, index: index}}]
   end
 
   def paging_options(%{"index" => index_string}) when is_binary(index_string) do
@@ -319,6 +547,10 @@ defmodule BlockScoutWeb.Chain do
   end
 
   def paging_options(%{"index" => index}) when is_integer(index) do
+    [paging_options: %{@default_paging_options | key: {index}}]
+  end
+
+  def paging_options(%{index: index}) do
     [paging_options: %{@default_paging_options | key: {index}}]
   end
 
@@ -353,9 +585,19 @@ defmodule BlockScoutWeb.Chain do
   def paging_options(%{"inserted_at" => inserted_at_string, "hash" => hash_string})
       when is_binary(inserted_at_string) and is_binary(hash_string) do
     with {:ok, inserted_at, _} <- DateTime.from_iso8601(inserted_at_string),
-         {:ok, hash} <- string_to_transaction_hash(hash_string) do
+         {:ok, hash} <- string_to_full_hash(hash_string) do
       [paging_options: %{@default_paging_options | key: {inserted_at, hash}, is_pending_transaction: true}]
     else
+      _ ->
+        [paging_options: @default_paging_options]
+    end
+  end
+
+  def paging_options(%{inserted_at: inserted_at, hash: hash_string}) when is_binary(hash_string) do
+    case string_to_full_hash(hash_string) do
+      {:ok, hash} ->
+        [paging_options: %{@default_paging_options | key: {inserted_at, hash}, is_pending_transaction: true}]
+
       _ ->
         [paging_options: @default_paging_options]
     end
@@ -364,7 +606,14 @@ defmodule BlockScoutWeb.Chain do
   def paging_options(%{"token_name" => name, "token_type" => type, "token_inserted_at" => inserted_at}),
     do: [paging_options: %{@default_paging_options | key: {name, type, inserted_at}}]
 
+  def paging_options(%{token_name: name, token_type: type, token_inserted_at: inserted_at}),
+    do: [paging_options: %{@default_paging_options | key: {name, type, inserted_at}}]
+
   def paging_options(%{"value" => value, "address_hash" => address_hash}) do
+    [paging_options: %{@default_paging_options | key: {value, address_hash}}]
+  end
+
+  def paging_options(%{value: value, address_hash: address_hash}) do
     [paging_options: %{@default_paging_options | key: {value, address_hash}}]
   end
 
@@ -383,17 +632,33 @@ defmodule BlockScoutWeb.Chain do
     end
   end
 
-  def paging_options(%{"smart_contract_id" => id_str} = params) do
-    transactions_count = parse_integer(params["transaction_count"])
-    coin_balance = parse_integer(params["coin_balance"])
-    id = parse_integer(id_str)
+  def paging_options(%{fiat_value: fiat_value_string, value: value_string, id: id})
+      when is_binary(fiat_value_string) and is_binary(value_string) do
+    with {value, ""} <- Decimal.parse(value_string),
+         {_id, _value, {fiat_value, ""}} <- {id, value, Decimal.parse(fiat_value_string)} do
+      [paging_options: %{@default_paging_options | key: {fiat_value, value, id}}]
+    else
+      {id, value, :error} ->
+        [paging_options: %{@default_paging_options | key: {nil, value, id}}]
 
-    [
-      paging_options: %{
-        @default_paging_options
-        | key: %{id: id, transactions_count: transactions_count, fetched_coin_balance: coin_balance}
-      }
-    ]
+      _ ->
+        [paging_options: @default_paging_options]
+    end
+  end
+
+  def paging_options(%{"value" => value_string, "id" => id_string})
+      when is_binary(value_string) and is_binary(id_string) do
+    with {id, ""} <- Integer.parse(id_string),
+         {value, ""} <- Decimal.parse(value_string) do
+      [paging_options: %{@default_paging_options | key: {nil, value, id}}]
+    else
+      _ ->
+        [paging_options: @default_paging_options]
+    end
+  end
+
+  def paging_options(%{value: value, id: id}) do
+    [paging_options: %{@default_paging_options | key: {nil, value, id}}]
   end
 
   def paging_options(%{"items_count" => items_count_string, "state_changes" => _}) when is_binary(items_count_string) do
@@ -403,9 +668,13 @@ defmodule BlockScoutWeb.Chain do
     end
   end
 
+  def paging_options(%{items_count: items_count, state_changes: _}) when is_integer(items_count) do
+    [paging_options: %{@default_paging_options | key: {items_count}}]
+  end
+
   def paging_options(%{"l1_block_number" => block_number, "transaction_hash" => transaction_hash}) do
     with {block_number, ""} <- Integer.parse(block_number),
-         {:ok, transaction_hash} <- string_to_transaction_hash(transaction_hash) do
+         {:ok, transaction_hash} <- string_to_full_hash(transaction_hash) do
       [paging_options: %{@default_paging_options | key: {block_number, transaction_hash}}]
     else
       _ ->
@@ -430,6 +699,16 @@ defmodule BlockScoutWeb.Chain do
     end
   end
 
+  def paging_options(%{"timestamp" => timestamp, "init_transaction_hash" => init_transaction_hash}) do
+    with {ts, ""} <- Integer.parse(timestamp),
+         {:ok, transaction_hash} <- string_to_full_hash(init_transaction_hash) do
+      [paging_options: %{@default_paging_options | key: {ts, transaction_hash}}]
+    else
+      _ ->
+        [paging_options: @default_paging_options]
+    end
+  end
+
   # clause for pagination of entities:
   # - Account's entities
   # - Optimism frame sequences
@@ -442,14 +721,14 @@ defmodule BlockScoutWeb.Chain do
   end
 
   def paging_options(%{
-        "token_contract_address_hash" => token_contract_address_hash,
-        "token_id" => token_id,
-        "token_type" => token_type
+        token_contract_address_hash: token_contract_address_hash,
+        token_id: token_id,
+        token_type: token_type
       }) do
     [paging_options: %{@default_paging_options | key: {token_contract_address_hash, token_id, token_type}}]
   end
 
-  def paging_options(%{"token_contract_address_hash" => token_contract_address_hash, "token_type" => token_type}) do
+  def paging_options(%{token_contract_address_hash: token_contract_address_hash, token_type: token_type}) do
     [paging_options: %{@default_paging_options | key: {token_contract_address_hash, token_type}}]
   end
 
@@ -488,6 +767,10 @@ defmodule BlockScoutWeb.Chain do
     [paging_options: %{@default_paging_options | key: %{block_index: index}}]
   end
 
+  def paging_options(%{block_index: index}) when is_integer(index) do
+    [paging_options: %{@default_paging_options | key: %{block_index: index}}]
+  end
+
   # Clause for `Explorer.Chain.Blackfort.Validator`,
   #  returned by `BlockScoutWeb.API.V2.ValidatorController.blackfort_validators_list/2` (`/api/v2/validators/blackfort`)
   def paging_options(%{
@@ -505,6 +788,26 @@ defmodule BlockScoutWeb.Chain do
 
   def paging_options(_params), do: [paging_options: @default_paging_options]
 
+  def hot_smart_contracts_paging_options(%{
+        transactions_count: transactions_count,
+        total_gas_used: total_gas_used,
+        contract_address_hash: contract_address_hash
+      }) do
+    [
+      paging_options: %{
+        @default_paging_options
+        | key: %{
+            transactions_count: transactions_count,
+            total_gas_used: total_gas_used,
+            contract_address_hash: contract_address_hash,
+            to_address_hash: contract_address_hash
+          }
+      }
+    ]
+  end
+
+  def hot_smart_contracts_paging_options(_params), do: [paging_options: @default_paging_options]
+
   def put_key_value_to_paging_options([paging_options: paging_options], key, value) do
     [paging_options: Map.put(paging_options, key, value)]
   end
@@ -519,8 +822,8 @@ defmodule BlockScoutWeb.Chain do
     end
   end
 
-  def fetch_page_number(%{"items_count" => item_count_str}) do
-    {items_count, _} = Integer.parse(item_count_str)
+  def fetch_page_number(%{"items_count" => items_count_str}) do
+    {items_count, _} = Integer.parse(items_count_str)
     div(items_count, @page_size) + 1
   end
 
@@ -530,6 +833,7 @@ defmodule BlockScoutWeb.Chain do
     %PagingOptions{options | page_number: new_page_number, page_size: new_page_size}
   end
 
+  @spec param_to_block_number(binary()) :: {:ok, integer()} | {:error, :invalid}
   def param_to_block_number(formatted_number) when is_binary(formatted_number) do
     case Integer.parse(formatted_number) do
       {number, ""} -> {:ok, number}
@@ -537,17 +841,24 @@ defmodule BlockScoutWeb.Chain do
     end
   end
 
+  @doc """
+  Converts a timestamp string to a `DateTime.t()` struct for block timestamp
+  queries.
+
+  ## Parameters
+  - `timestamp_string`: A string containing a Unix timestamp in seconds
+
+  ## Returns
+  - `{:ok, DateTime.t()}` if the timestamp is valid and can be converted
+  - `{:error, :invalid_timestamp}` if the timestamp is invalid or out of range
+  """
+  @spec param_to_block_timestamp(String.t()) :: {:ok, DateTime.t()} | {:error, :invalid_timestamp}
   def param_to_block_timestamp(timestamp_string) when is_binary(timestamp_string) do
-    case Integer.parse(timestamp_string) do
-      {timestamp_int, ""} ->
-        timestamp =
-          timestamp_int
-          |> DateTime.from_unix!(:second)
-
-        {:ok, timestamp}
-
-      _ ->
-        {:error, :invalid_timestamp}
+    with {timestamp_int, ""} <- Integer.parse(timestamp_string),
+         {:ok, timestamp} <- DateTime.from_unix(timestamp_int, :second) do
+      {:ok, timestamp}
+    else
+      _ -> {:error, :invalid_timestamp}
     end
   end
 
@@ -571,7 +882,7 @@ defmodule BlockScoutWeb.Chain do
   defp address_from_param(param) do
     case string_to_address_hash(param) do
       {:ok, hash} ->
-        find_or_insert_address_from_hash(hash)
+        {:ok, %Address{hash: hash}}
 
       :error ->
         {:error, :not_found}
@@ -595,24 +906,32 @@ defmodule BlockScoutWeb.Chain do
     end
   end
 
-  defp paging_params({%Address{hash: hash, fetched_coin_balance: fetched_coin_balance}, _}) do
-    %{"hash" => hash, "fetched_coin_balance" => Decimal.to_string(fetched_coin_balance.value)}
+  defp paging_params(%Address{
+         hash: hash,
+         fetched_coin_balance: fetched_coin_balance,
+         transactions_count: transactions_count
+       }) do
+    %{
+      hash: hash,
+      fetched_coin_balance: fetched_coin_balance && Wei.to(fetched_coin_balance, :wei),
+      transactions_count: transactions_count
+    }
   end
 
   defp paging_params(%Token{
          contract_address_hash: contract_address_hash,
          circulating_market_cap: circulating_market_cap,
-         holder_count: holder_count,
+         holder_count: holders_count,
          name: token_name,
          fiat_value: fiat_value
        }) do
     %{
-      "market_cap" => circulating_market_cap,
-      "holder_count" => holder_count,
-      "contract_address_hash" => contract_address_hash,
-      "name" => token_name,
-      "is_name_null" => is_nil(token_name),
-      "fiat_value" => fiat_value
+      market_cap: circulating_market_cap,
+      holders_count: holders_count,
+      contract_address_hash: contract_address_hash,
+      name: token_name,
+      is_name_null: is_nil(token_name),
+      fiat_value: fiat_value
     }
   end
 
@@ -645,20 +964,23 @@ defmodule BlockScoutWeb.Chain do
   end
 
   defp paging_params(%Block{number: number}) do
-    %{"block_number" => number}
+    %{block_number: number}
   end
 
-  defp paging_params(%InternalTransaction{index: index, transaction_hash: transaction_hash}) do
-    {:ok, %Transaction{block_number: block_number, index: transaction_index}} = hash_to_transaction(transaction_hash)
-    %{"block_number" => block_number, "transaction_index" => transaction_index, "index" => index}
+  defp paging_params(%InternalTransaction{
+         index: index,
+         transaction_index: transaction_index,
+         block_number: block_number
+       }) do
+    %{block_number: block_number, transaction_index: transaction_index, index: index}
   end
 
   defp paging_params(%Log{index: index, block_number: block_number}) do
-    %{"block_number" => block_number, "index" => index}
+    %{block_number: block_number, index: index}
   end
 
   defp paging_params(%Transaction{block_number: nil, inserted_at: inserted_at, hash: hash}) do
-    %{"inserted_at" => DateTime.to_iso8601(inserted_at), "hash" => hash}
+    %{inserted_at: DateTime.to_iso8601(inserted_at), hash: hash}
   end
 
   defp paging_params(%Transaction{block_number: block_number, index: index}) do
@@ -666,7 +988,7 @@ defmodule BlockScoutWeb.Chain do
   end
 
   defp paging_params(%TokenTransfer{block_number: block_number, log_index: index}) do
-    %{"block_number" => block_number, "index" => index}
+    %{block_number: block_number, index: index}
   end
 
   defp paging_params(%Address.Token{name: name, type: type, inserted_at: inserted_at}) do
@@ -676,15 +998,15 @@ defmodule BlockScoutWeb.Chain do
   end
 
   defp paging_params(%CurrentTokenBalance{address_hash: address_hash, value: value}) do
-    %{"address_hash" => to_string(address_hash), "value" => Decimal.to_integer(value)}
+    %{address_hash: to_string(address_hash), value: to_string(Decimal.to_integer(value))}
   end
 
   defp paging_params(%CoinBalance{block_number: block_number}) do
-    %{"block_number" => block_number}
+    %{block_number: block_number}
   end
 
   defp paging_params(%SmartContract{address: %NotLoaded{}} = smart_contract) do
-    %{"smart_contract_id" => smart_contract.id}
+    %{smart_contract_id: smart_contract.id}
   end
 
   defp paging_params(%OptimismDeposit{l1_block_number: l1_block_number, l2_transaction_hash: l2_transaction_hash}) do
@@ -695,11 +1017,15 @@ defmodule BlockScoutWeb.Chain do
     %{"index" => index}
   end
 
+  defp paging_params(%OptimismInteropMessage{timestamp: timestamp, init_transaction_hash: init_transaction_hash}) do
+    %{"timestamp" => DateTime.to_unix(timestamp), "init_transaction_hash" => init_transaction_hash}
+  end
+
   defp paging_params(%SmartContract{} = smart_contract) do
     %{
-      "smart_contract_id" => smart_contract.id,
-      "transaction_count" => smart_contract.address.transactions_count,
-      "coin_balance" =>
+      smart_contract_id: smart_contract.id,
+      transactions_count: smart_contract.address.transactions_count,
+      coin_balance:
         smart_contract.address.fetched_coin_balance && Wei.to(smart_contract.address.fetched_coin_balance, :wei)
     }
   end
@@ -710,6 +1036,10 @@ defmodule BlockScoutWeb.Chain do
 
   defp paging_params(%{index: index}) do
     %{"index" => index}
+  end
+
+  defp paging_params(%Withdrawal{index: index}) do
+    %{index: index}
   end
 
   defp paging_params(%{msg_nonce: nonce}) do
@@ -730,7 +1060,8 @@ defmodule BlockScoutWeb.Chain do
   end
 
   defp paging_params(%StateChange{}) do
-    %{"state_changes" => nil}
+    # todo: remove in the future as this param is unused in the pagination of state changes
+    %{state_changes: nil}
   end
 
   # clause for Polygon Edge Deposits and Withdrawals
@@ -749,14 +1080,14 @@ defmodule BlockScoutWeb.Chain do
   end
 
   @spec paging_params_with_fiat_value(CurrentTokenBalance.t()) :: %{
-          required(String.t()) => Decimal.t() | non_neg_integer() | nil
+          required(atom()) => Decimal.t() | non_neg_integer() | nil
         }
   def paging_params_with_fiat_value(%CurrentTokenBalance{id: id, value: value} = ctb) do
-    %{"fiat_value" => ctb.fiat_value, "value" => value, "id" => id}
+    %{fiat_value: ctb.fiat_value, value: value, id: id}
   end
 
   defp block_or_transaction_or_operation_or_blob_from_param(param) do
-    with {:ok, hash} <- string_to_transaction_hash(param),
+    with {:ok, hash} <- string_to_full_hash(param),
          {:error, :not_found} <- hash_to_transaction(hash),
          {:error, :not_found} <- hash_to_block(hash),
          {:error, :not_found} <- hash_to_user_operation(hash),
@@ -787,15 +1118,31 @@ defmodule BlockScoutWeb.Chain do
   def unique_tokens_paging_options(%{"unique_token" => token_id}),
     do: [paging_options: %{default_paging_options() | key: {token_id}}]
 
+  def unique_tokens_paging_options(%{unique_token: token_id}),
+    do: [paging_options: %{default_paging_options() | key: {token_id}}]
+
   def unique_tokens_paging_options(_params), do: [paging_options: default_paging_options()]
 
   def unique_tokens_next_page([], _list, _params), do: nil
 
   def unique_tokens_next_page(_, list, params) do
-    Map.merge(params, paging_params(List.last(list)))
+    params
+    |> Map.merge(paging_params(List.last(list)))
+    |> delete_parameters_from_next_page_params()
   end
 
   def token_transfers_next_page_params([], _list, _params), do: nil
+
+  @batch_transfer_fields_to_delete_from_next_page_params [
+    "batch_log_index",
+    "batch_block_hash",
+    "batch_transaction_hash",
+    "index_in_batch",
+    :batch_log_index,
+    :batch_block_hash,
+    :batch_transaction_hash,
+    :index_in_batch
+  ]
 
   def token_transfers_next_page_params(next_page, list, params) do
     next_token_transfer = List.first(next_page)
@@ -809,16 +1156,29 @@ defmodule BlockScoutWeb.Chain do
         |> last_token_transfer_before_current(current_token_transfer)
         |> (&if(is_nil(&1), do: %{}, else: paging_params(&1))).()
 
+      # todo: consider removing it, when all controllers will get OpenAPI specs
+      string_keys = map_to_string_keys(new_params)
+
       params
+      |> delete_parameters_from_next_page_params()
+      |> Map.drop(@batch_transfer_fields_to_delete_from_next_page_params ++ string_keys)
       |> Map.merge(new_params)
       |> Map.merge(%{
-        "batch_log_index" => current_token_transfer.log_index,
-        "batch_block_hash" => current_token_transfer.block_hash,
-        "batch_transaction_hash" => current_token_transfer.transaction_hash,
-        "index_in_batch" => current_token_transfer.index_in_batch
+        batch_log_index: current_token_transfer.log_index,
+        batch_block_hash: current_token_transfer.block_hash,
+        batch_transaction_hash: current_token_transfer.transaction_hash,
+        index_in_batch: current_token_transfer.index_in_batch
       })
     else
-      Map.merge(params, paging_params(List.last(list)))
+      new_params = paging_params(List.last(list))
+
+      # todo: consider removing it, when all controllers will get OpenAPI specs
+      string_keys = map_to_string_keys(new_params)
+
+      params
+      |> delete_parameters_from_next_page_params()
+      |> Map.drop(@batch_transfer_fields_to_delete_from_next_page_params ++ string_keys)
+      |> Map.merge(new_params)
     end
   end
 
@@ -834,7 +1194,7 @@ defmodule BlockScoutWeb.Chain do
   end
 
   def parse_block_hash_or_number_param("0x" <> _ = param) do
-    case string_to_block_hash(param) do
+    case string_to_full_hash(param) do
       {:ok, hash} ->
         {:ok, :hash, hash}
 
@@ -852,5 +1212,298 @@ defmodule BlockScoutWeb.Chain do
       {:error, :invalid} ->
         {:error, {:invalid, :number}}
     end
+  end
+
+  def parse_block_hash_or_number_param(number)
+      when is_integer(number) do
+    {:ok, :number, number}
+  end
+
+  @doc """
+  Determines the scam token toggle value and adds it to the params keyword list.
+
+  The function checks for the scam token toggle in the following order:
+  1. Looks for the `"show-scam-tokens"` request header
+  2. Falls back to the `"show_scam_tokens"` cookie if the header is not present
+  3. Parses the retrieved value as a boolean (defaults to `false` if the value
+     is neither `"true"`, `"false"`, `true`, nor `false`)
+
+  ## Parameters
+  - `params`: Initial params keyword list to append scam token toggle info.
+  - `conn`: The connection struct.
+
+  ## Returns
+  The provided params keyword list with the added `show_scam_tokens?` field
+  set to a boolean value.
+  """
+  @spec fetch_scam_token_toggle(Keyword.t(), Plug.Conn.t()) :: Keyword.t()
+  def fetch_scam_token_toggle(params, conn) do
+    Keyword.put(
+      params,
+      :show_scam_tokens?,
+      conn
+      |> Conn.get_req_header("show-scam-tokens")
+      |> case do
+        [show_scam_tokens?] -> show_scam_tokens?
+        _ -> conn.cookies["show_scam_tokens"]
+      end
+      |> parse_boolean()
+    )
+  end
+
+  @doc """
+    Fetches latest internal transactions, routing to either the database or on-demand RPC source.
+
+    When internal transactions are present in the database (for recent blocks
+    within the storage period), they are fetched from the DB. For older blocks
+    where zero-value internal transactions have been deleted, the function
+    falls back to fetching on-demand from the JSON-RPC node.
+
+    ## Parameters
+    - `options`: Keyword list with optional keys:
+      - `:paging_options` - pagination options including page_size and key
+      - `:transaction_hash` - filter by specific transaction option
+
+    ## Returns
+    - List of InternalTransaction structs
+  """
+  @spec fetch_internal_transactions(Keyword.t()) :: [InternalTransaction.t()]
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  def fetch_internal_transactions(options) do
+    paging_options = Keyword.get(options, :paging_options, @default_paging_options)
+    transaction_hash = Keyword.get(options, :transaction_hash)
+
+    necessity_by_association =
+      %{
+        :block => :optional,
+        [from_address: [:scam_badge, :names, :smart_contract, proxy_implementations_association()]] => :optional,
+        [to_address: [:scam_badge, :names, :smart_contract, proxy_implementations_association()]] => :optional
+      }
+
+    options_with_necessity = Keyword.put_new(options, :necessity_by_association, necessity_by_association)
+
+    cond do
+      match?(%PagingOptions{key: {0, 0, 0}}, paging_options) or
+          match?(%PagingOptions{key: %{transaction_index: 0, index: 0}}, paging_options) ->
+        []
+
+      not is_nil(transaction_hash) ->
+        case hash_to_transaction(transaction_hash) do
+          {:ok, transaction} ->
+            transaction_to_internal_transactions(transaction, options_with_necessity)
+
+          {:error, :not_found} ->
+            []
+        end
+
+      match?(%PagingOptions{key: {_, _, _}}, paging_options) and
+          not InternalTransaction.present_in_db?(elem(paging_options.key, 0)) ->
+        InternalTransactionOnDemand.fetch_latest(options_with_necessity)
+
+      Application.get_env(:explorer, DeleteZeroValueInternalTransactions)[:enabled] ->
+        from_db = InternalTransaction.fetch(options)
+
+        from_node =
+          if InternalTransactionOnDemand.should_fetch?(from_db, paging_options.page_size) do
+            InternalTransactionOnDemand.fetch_latest(options_with_necessity)
+          else
+            []
+          end
+
+        merge_internal_transactions(from_db, from_node, paging_options.page_size)
+
+      true ->
+        InternalTransaction.fetch(options)
+    end
+  end
+
+  @doc """
+    Fetches internal transactions for the given transaction, routing to either the database or on-demand RPC source.
+
+    When internal transactions are present in the database (for recent blocks
+    within the storage period), they are fetched from the DB. For older blocks
+    where zero-value internal transactions have been deleted, the function
+    falls back to fetching on-demand from the JSON-RPC node.
+
+    ## Parameters
+    - `transaction`: The transaction struct to fetch internal transactions for
+    - `options`: Keyword list with optional keys:
+      - `:necessity_by_association` - associations to preload as required or optional
+      - `:paging_options` - pagination options including page_size and key
+
+    ## Returns
+    - List of InternalTransaction structs for the given transaction
+  """
+  @spec transaction_to_internal_transactions(Transaction.t(), Keyword.t()) :: [InternalTransaction.t()]
+  def transaction_to_internal_transactions(transaction, options \\ []) do
+    if InternalTransaction.present_in_db?(transaction.block_number) do
+      InternalTransaction.transaction_to_internal_transactions(transaction.hash, options)
+    else
+      InternalTransactionOnDemand.fetch_by_transaction(transaction, options)
+    end
+  end
+
+  @doc """
+    Fetches internal transactions for the given block, routing to either the database or on-demand RPC source.
+
+    When internal transactions are present in the database (for recent blocks
+    within the storage period), they are fetched from the DB. For older blocks
+    where zero-value internal transactions have been deleted, the function
+    falls back to fetching on-demand from the JSON-RPC node.
+
+    ## Parameters
+    - `block`: The block struct to fetch internal transactions for
+    - `options`: Keyword list with optional keys:
+      - `:necessity_by_association` - associations to preload as required or optional
+      - `:paging_options` - pagination options including page_size and key
+      - `:type` - filter by transaction type
+      - `:call_type` - filter by call type
+
+    ## Returns
+    - List of InternalTransaction structs for the given block
+  """
+  @spec block_to_internal_transactions(Block.t(), Keyword.t()) :: [InternalTransaction.t()]
+  def block_to_internal_transactions(block, options \\ []) do
+    if InternalTransaction.present_in_db?(block.number) do
+      InternalTransaction.block_to_internal_transactions(block.hash, options)
+    else
+      InternalTransactionOnDemand.fetch_by_block(block, options)
+    end
+  end
+
+  @doc """
+    Fetches internal transactions for the given address by combining DB and on-demand sources.
+
+    It first loads DB-backed internal transactions for the requested page, then
+    fetches additional items on-demand via JSON-RPC if needed. The merged list is
+    deduplicated, sorted in descending order, and trimmed to the requested page size.
+
+    ## Parameters
+    - `address_hash`: The address hash to fetch internal transactions for
+    - `options`: Keyword list with optional keys:
+      - `:paging_options` - pagination options including page_size and key
+      - `:necessity_by_association` - associations to preload as required or optional
+
+    ## Returns
+    - List of InternalTransaction structs for the given address
+  """
+  @spec address_to_internal_transactions(Hash.Address.t(), Keyword.t()) :: [InternalTransaction.t()]
+  def address_to_internal_transactions(address_hash, options \\ []) do
+    paging_options = Keyword.get(options, :paging_options, default_paging_options())
+
+    case paging_options do
+      %PagingOptions{key: {0, 0, 0}} ->
+        []
+
+      _ ->
+        from_db = InternalTransaction.fetch_from_db_by_address(address_hash, options)
+
+        from_node =
+          if InternalTransactionOnDemand.should_fetch?(from_db, paging_options.page_size) do
+            InternalTransactionOnDemand.fetch_by_address(address_hash, options)
+          else
+            []
+          end
+
+        merge_internal_transactions(from_db, from_node, paging_options.page_size)
+    end
+  end
+
+  @doc """
+    Works similar to `Explorer.Etherscan.list_internal_transactions/2`
+    but using DB or on-demand RPC based on internal transactions presence in DB.
+
+    When internal transactions are present in the database (for recent blocks
+    within the storage period), they are fetched from the DB. For older blocks
+    where zero-value internal transactions have been deleted, the function
+    falls back to fetching on-demand from the JSON-RPC node.
+
+    ## Parameters
+    - `transaction_or_address_hash_param_or_no_param`: Transaction or address hash or `:all` as a source to fetching internal transactions
+    - `options`: Map of options
+
+    ## Returns
+    - List of InternalTransaction fields maps for the given param
+  """
+  @spec list_internal_transactions(Hash.Full.t() | Hash.Address.t() | :all, map()) :: [map()]
+  def list_internal_transactions(%Hash{byte_count: unquote(Hash.Full.byte_count())} = transaction_hash, raw_options) do
+    options = Map.merge(Etherscan.default_options(), raw_options)
+
+    case hash_to_transaction(transaction_hash) do
+      {:ok, transaction} ->
+        if not options.include_zero_value or InternalTransaction.present_in_db?(transaction.block_number) do
+          Etherscan.list_internal_transactions(transaction.hash, options)
+        else
+          InternalTransactionOnDemand.etherscan_fetch_by_transaction(transaction, options)
+        end
+
+      {:error, :not_found} ->
+        []
+    end
+  end
+
+  def list_internal_transactions(%Hash{byte_count: unquote(Hash.Address.byte_count())} = address_hash, raw_options) do
+    from_db = Etherscan.list_internal_transactions(address_hash, raw_options)
+
+    options = Map.merge(Etherscan.default_options(), raw_options)
+
+    from_node =
+      if options.include_zero_value and InternalTransactionOnDemand.should_fetch?(from_db, options.page_size) do
+        InternalTransactionOnDemand.etherscan_fetch_by_address(address_hash, options)
+      else
+        []
+      end
+
+    merge_internal_transactions(from_db, from_node, options.page_size, options.order_by_direction)
+  end
+
+  def list_internal_transactions(:all, raw_options) do
+    options = Map.merge(Etherscan.default_options(), raw_options)
+
+    cond do
+      not options.include_zero_value ->
+        Etherscan.list_internal_transactions(:all, options)
+
+      not is_nil(options[:endblock]) and not InternalTransaction.present_in_db?(options[:endblock]) ->
+        InternalTransactionOnDemand.etherscan_fetch_latest(options)
+
+      Application.get_env(:explorer, DeleteZeroValueInternalTransactions)[:enabled] ->
+        from_db = Etherscan.list_internal_transactions(:all, options)
+
+        from_node =
+          if InternalTransactionOnDemand.should_fetch?(from_db, options.page_size) do
+            InternalTransactionOnDemand.etherscan_fetch_latest(options)
+          else
+            []
+          end
+
+        merge_internal_transactions(from_db, from_node, options.page_size, options.order_by_direction)
+
+      true ->
+        Etherscan.list_internal_transactions(:all, options)
+    end
+  end
+
+  defp merge_internal_transactions(first_list, second_list, limit, sort_direction \\ :desc) do
+    sort_func =
+      case sort_direction do
+        :asc -> &<=/2
+        _ -> &>=/2
+      end
+
+    first_list
+    |> Enum.concat(second_list)
+    |> Enum.uniq_by(&{&1.block_number, &1.transaction_index, &1.index})
+    |> Enum.sort_by(&{&1.block_number, &1.transaction_index, &1.index}, sort_func)
+    |> Enum.take(limit)
+  end
+
+  defp map_to_string_keys(map) do
+    map
+    |> Map.keys()
+    |> Enum.map(fn
+      key when is_atom(key) -> Atom.to_string(key)
+      key -> key
+    end)
   end
 end

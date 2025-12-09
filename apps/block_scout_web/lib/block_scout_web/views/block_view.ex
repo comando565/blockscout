@@ -7,7 +7,7 @@ defmodule BlockScoutWeb.BlockView do
   alias Explorer.Chain
   alias Explorer.Chain.{Block, Wei}
   alias Explorer.Chain.Block.Reward
-  alias Explorer.Counters.{BlockBurntFeeCounter, BlockPriorityFeeCounter}
+  alias Explorer.Chain.Cache.Counters.{BlockBurntFeeCount, BlockPriorityFeeCount}
 
   @dialyzer :no_match
 

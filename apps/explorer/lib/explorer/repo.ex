@@ -134,6 +134,7 @@ defmodule Explorer.Repo do
         Explorer.Repo.Account,
         Explorer.Repo.BridgedTokens,
         Explorer.Repo.ShrunkInternalTransactions,
+        Explorer.Repo.EventNotifications,
 
         # Chain-type dependent repos
         Explorer.Repo.Arbitrum,
@@ -151,7 +152,8 @@ defmodule Explorer.Repo do
         Explorer.Repo.Stability,
         Explorer.Repo.Suave,
         Explorer.Repo.Zilliqa,
-        Explorer.Repo.ZkSync
+        Explorer.Repo.ZkSync,
+        Explorer.Repo.Neon
       ] do
     defmodule repo do
       use Ecto.Repo,
